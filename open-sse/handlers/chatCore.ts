@@ -2801,7 +2801,9 @@ export async function handleChatCore({
                       ),
                   });
                 },
-                streamController.signal
+                streamController.signal,
+                true,
+                webCookieProvider ? WEB_ACCOUNT_QUEUE_TIMEOUT_MS : null
               );
               const res = normalizeExecutorResult(rawExecutorResult);
               trace("post_executor", { status: res?.response?.status });

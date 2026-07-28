@@ -111,3 +111,30 @@ test("#4165 a job that completes within maxWaitMs is unaffected", async () => {
   );
   assert.equal(result, "ok");
 });
+
+test("a caller may raise the queue expiration for slow web-provider requests", async () => {
+  await rateLimitManager.applyRequestQueueSettings({
+    ...resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue,
+    autoEnableApiKeyProviders: false,
+    concurrentRequests: 1,
+    requestsPerMinute: 100000,
+    minTimeBetweenRequestsMs: 0,
+    maxWaitMs: 40,
+  });
+  rateLimitManager.enableRateLimitProtection("conn-slow-web");
+
+  const result = await rateLimitManager.withRateLimit(
+    "gemini-web",
+    "conn-slow-web",
+    "gemini-3.5-flash",
+    async () => {
+      await wait(100);
+      return "ok";
+    },
+    null,
+    true,
+    1000
+  );
+
+  assert.equal(result, "ok");
+});

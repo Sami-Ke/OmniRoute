@@ -583,7 +583,8 @@ export async function withRateLimit(
   model,
   fn,
   signal = null,
-  retryAfterWedge = true
+  retryAfterWedge = true,
+  maxWaitMsOverride = null
 ) {
   if (!enabledConnections.has(connectionId)) {
     return fn();
@@ -599,15 +600,15 @@ export async function withRateLimit(
 
   // Proactive sliding-window fallback for header-less providers with a declared cap
   // (Fase 8.2). No-op unless PROVIDER_DEFAULT_RATE_LIMITS has an entry for `provider`.
-  await awaitProviderDefaultSlot(
-    provider,
-    connectionId,
-    signal,
-    currentRequestQueueSettings.maxWaitMs
-  );
+  const configuredMaxWaitMs = currentRequestQueueSettings.maxWaitMs;
+  const maxWaitMs =
+    Number.isFinite(maxWaitMsOverride) && maxWaitMsOverride > 0
+      ? Math.max(configuredMaxWaitMs || 0, maxWaitMsOverride)
+      : configuredMaxWaitMs;
+
+  await awaitProviderDefaultSlot(provider, connectionId, signal, maxWaitMs);
 
   const limiter = getLimiter(provider, connectionId, model);
-  const maxWaitMs = currentRequestQueueSettings.maxWaitMs;
   const scheduleOpts = maxWaitMs && maxWaitMs > 0 ? { expiration: maxWaitMs } : {};
 
   // Issue #6593: opt-in admission cap — fast-reject before Bottleneck's
@@ -687,7 +688,7 @@ export async function withRateLimit(
       if (limiterIsWedged) {
         logRateLimit(`🔄 [RATE-LIMIT] ${key} — recovering idle limiter after queue expiry`);
         evictWedgeLimiter(key, limiter);
-        return withRateLimit(provider, connectionId, model, fn, signal, false);
+        return withRateLimit(provider, connectionId, model, fn, signal, false, maxWaitMsOverride);
       }
       const queueErr = new Error(
         `Request dropped after exceeding the local rate-limit queue budget maxWaitMs (${maxWaitMs}ms) for ` +
