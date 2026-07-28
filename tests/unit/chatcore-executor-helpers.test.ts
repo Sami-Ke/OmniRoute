@@ -5,6 +5,10 @@ import {
   resolveAccountSemaphoreKey,
   resolveAccountSemaphoreAccountKey,
   resolveAccountSemaphoreMaxConcurrency,
+  isWebCookieProvider,
+  enforceWebCookieStreamMode,
+  WEB_ACCOUNT_MAX_QUEUE_SIZE,
+  WEB_ACCOUNT_QUEUE_TIMEOUT_MS,
   buildClaudePromptCacheLogMeta,
 } from "../../open-sse/handlers/chatCore/executorHelpers.ts";
 import { FORMATS } from "../../open-sse/translator/formats.ts";
@@ -31,7 +35,13 @@ test("resolveAccountSemaphoreAccountKey returns null when nothing usable is pres
   assert.equal(resolveAccountSemaphoreAccountKey(undefined, undefined), null);
   assert.equal(resolveAccountSemaphoreAccountKey("", {}), null);
   // non-string / blank candidates are all rejected
-  assert.equal(resolveAccountSemaphoreAccountKey("", { id: 123, email: "   " } as unknown as Record<string, unknown>), null);
+  assert.equal(
+    resolveAccountSemaphoreAccountKey("", { id: 123, email: "   " } as unknown as Record<
+      string,
+      unknown
+    >),
+    null
+  );
 });
 
 test("resolveAccountSemaphoreMaxConcurrency parses finite numbers and numeric strings", () => {
@@ -51,9 +61,29 @@ test("resolveAccountSemaphoreMaxConcurrency rejects non-finite / non-numeric / m
   assert.equal(resolveAccountSemaphoreMaxConcurrency({ maxConcurrent: "abc" }), null);
   assert.equal(resolveAccountSemaphoreMaxConcurrency({ maxConcurrent: "" }), null);
   assert.equal(resolveAccountSemaphoreMaxConcurrency({ maxConcurrent: "   " }), null);
-  assert.equal(resolveAccountSemaphoreMaxConcurrency({ maxConcurrent: true } as unknown as Record<string, unknown>), null);
+  assert.equal(
+    resolveAccountSemaphoreMaxConcurrency({ maxConcurrent: true } as unknown as Record<
+      string,
+      unknown
+    >),
+    null
+  );
   assert.equal(resolveAccountSemaphoreMaxConcurrency({}), null);
   assert.equal(resolveAccountSemaphoreMaxConcurrency(null), null);
+});
+
+test("web-cookie providers always use one request per account with a bounded long queue", () => {
+  assert.equal(isWebCookieProvider("chatgpt-web"), true);
+  assert.equal(isWebCookieProvider("gemini-web"), true);
+  assert.equal(isWebCookieProvider("openai"), false);
+  assert.equal(resolveAccountSemaphoreMaxConcurrency({ maxConcurrent: 8 }, "chatgpt-web"), 1);
+  assert.equal(resolveAccountSemaphoreMaxConcurrency({}, "gemini-web"), 1);
+  assert.equal(WEB_ACCOUNT_QUEUE_TIMEOUT_MS, 600_000);
+  assert.equal(WEB_ACCOUNT_MAX_QUEUE_SIZE, 100);
+  assert.equal(enforceWebCookieStreamMode("gemini-web", undefined, true), false);
+  assert.equal(enforceWebCookieStreamMode("gemini-web", false, true), false);
+  assert.equal(enforceWebCookieStreamMode("gemini-web", true, false), true);
+  assert.equal(enforceWebCookieStreamMode("openai", undefined, true), true);
 });
 
 test("resolveAccountSemaphoreKey builds provider:accountKey when both resolve", () => {
@@ -81,16 +111,31 @@ test("resolveAccountSemaphoreKey builds provider:accountKey when both resolve", 
 test("resolveAccountSemaphoreKey returns null without a provider or account key", () => {
   // no account key resolvable
   assert.equal(
-    resolveAccountSemaphoreKey({ provider: "openai", model: "m", connectionId: null, credentials: null }),
+    resolveAccountSemaphoreKey({
+      provider: "openai",
+      model: "m",
+      connectionId: null,
+      credentials: null,
+    }),
     null
   );
   // account key resolves but provider missing
   assert.equal(
-    resolveAccountSemaphoreKey({ provider: null, model: "m", connectionId: "conn", credentials: null }),
+    resolveAccountSemaphoreKey({
+      provider: null,
+      model: "m",
+      connectionId: "conn",
+      credentials: null,
+    }),
     null
   );
   assert.equal(
-    resolveAccountSemaphoreKey({ provider: "", model: "m", connectionId: "conn", credentials: null }),
+    resolveAccountSemaphoreKey({
+      provider: "",
+      model: "m",
+      connectionId: "conn",
+      credentials: null,
+    }),
     null
   );
 });

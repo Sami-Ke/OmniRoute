@@ -11,9 +11,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { GeminiWebExecutor, buildGeminiToolResponse, buildGeminiToolPrompt } = await import(
-  "../../open-sse/executors/gemini-web.ts"
-);
+const { GeminiWebExecutor, buildGeminiToolResponse, buildGeminiToolPrompt } =
+  await import("../../open-sse/executors/gemini-web.ts");
 
 interface ToolCallLike {
   function: { name: string; arguments: string };
@@ -70,6 +69,7 @@ test("#7286: well-formed tool call → tool_calls, content:null, finish_reason:t
   assert.equal(choice.finish_reason, "tool_calls");
   assert.equal(choice.message.tool_calls.length, 1);
   assert.equal(choice.message.tool_calls[0].function.name, "get_weather");
+  assert.deepEqual(choice.message.annotations, []);
   assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
     city: "Paris",
   });
@@ -145,6 +145,7 @@ test("#7286: no <tool> block and no requested tools → toolCalls untouched (pla
   assert.equal(choice.finish_reason, "stop");
   assert.equal(choice.message.tool_calls, undefined);
   assert.equal(choice.message.content, "Just a normal answer, nothing to call.");
+  assert.deepEqual(choice.message.annotations, []);
 });
 
 // ─── buildGeminiToolPrompt ───────────────────────────────────────────────────
@@ -238,8 +239,7 @@ async function withMockedGeminiBrowser<T>(
 }
 
 test("#7286: executor integration — tools[] present reaches tool_calls end to end", async () => {
-  const responseText =
-    '<tool>{"name":"get_weather","arguments":{"city":"Berlin"}}</tool>';
+  const responseText = '<tool>{"name":"get_weather","arguments":{"city":"Berlin"}}</tool>';
 
   await withMockedGeminiBrowser(responseText, async () => {
     const executor = new GeminiWebExecutor();
@@ -261,6 +261,7 @@ test("#7286: executor integration — tools[] present reaches tool_calls end to 
     const choice = json.choices[0];
     assert.equal(choice.finish_reason, "tool_calls");
     assert.equal(choice.message.tool_calls?.[0].function.name, "get_weather");
+    assert.deepEqual(choice.message.annotations, []);
   });
 });
 

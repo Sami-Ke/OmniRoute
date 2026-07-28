@@ -25,6 +25,14 @@ export interface ProviderMetricRow {
   lastErrorStatus: number | null;
 }
 
+export interface ProviderTodayMetricRow {
+  provider: string;
+  usedToday: number;
+  successfulToday: number;
+  lastError: string | null;
+  lastErrorAt: string | null;
+}
+
 export interface SearchProviderStatRow {
   provider: string;
   requests: number;
@@ -99,6 +107,51 @@ export function getProviderMetrics(): ProviderMetricRow[] {
         GROUP BY c.provider`
     )
     .all() as ProviderMetricRow[];
+}
+
+/**
+ * UTC-day request counts and the latest sanitized-at-the-route error summary,
+ * grouped by provider. Used by the API-key-safe /v1/channels endpoint.
+ */
+export function getProviderTodayMetrics(): ProviderTodayMetricRow[] {
+  const db = getDbInstance();
+  return db
+    .prepare(
+      `SELECT
+          c.provider,
+          COUNT(*) as usedToday,
+          SUM(CASE WHEN c.status >= 200 AND c.status < 400 THEN 1 ELSE 0 END) as successfulToday,
+          (
+            SELECT c2.error_summary
+            FROM call_logs c2
+            WHERE c2.provider = c.provider
+              AND c2.timestamp >= datetime('now', 'start of day')
+              AND (
+                (c2.status IS NOT NULL AND (c2.status < 200 OR c2.status >= 400))
+                OR c2.error_summary IS NOT NULL
+              )
+            ORDER BY c2.timestamp DESC, c2.id DESC
+            LIMIT 1
+          ) as lastError,
+          (
+            SELECT c3.timestamp
+            FROM call_logs c3
+            WHERE c3.provider = c.provider
+              AND c3.timestamp >= datetime('now', 'start of day')
+              AND (
+                (c3.status IS NOT NULL AND (c3.status < 200 OR c3.status >= 400))
+                OR c3.error_summary IS NOT NULL
+              )
+            ORDER BY c3.timestamp DESC, c3.id DESC
+            LIMIT 1
+          ) as lastErrorAt
+        FROM call_logs c
+        WHERE c.provider IS NOT NULL
+          AND c.provider != '-'
+          AND c.timestamp >= datetime('now', 'start of day')
+        GROUP BY c.provider`
+    )
+    .all() as ProviderTodayMetricRow[];
 }
 
 // ---------------------------------------------------------------------------

@@ -15,10 +15,12 @@ import {
 import { handleChatCore } from "@omniroute/open-sse/handlers/chatCore.ts";
 import {
   errorResponse,
+  channelErrorResponse,
   modelCooldownResponse,
   providerCircuitOpenResponse,
   unavailableResponse,
 } from "@omniroute/open-sse/utils/error.ts";
+import { isWebCookieProvider } from "@omniroute/open-sse/handlers/chatCore/executorHelpers.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import {
   runWithProxyContext,
@@ -601,7 +603,8 @@ export function handleNoCredentials(
       status,
       `[${provider}/${model}] ${errorMsg}`,
       credentials.retryAfter,
-      credentials.retryAfterHuman
+      credentials.retryAfterHuman,
+      isWebCookieProvider(provider) ? { channel: provider } : undefined
     );
   }
 
@@ -620,6 +623,14 @@ export function handleNoCredentials(
           : "authentication expired";
     const message = `[${provider}] All ${count} connection(s) ${reason} — please reconnect in the dashboard`;
     log.warn("CHAT", message);
+    if (isWebCookieProvider(provider)) {
+      return channelErrorResponse(
+        HTTP_STATUS.UNAUTHORIZED,
+        message,
+        provider,
+        "UPSTREAM_AUTH_FAILED"
+      );
+    }
     return errorResponse(HTTP_STATUS.UNAUTHORIZED, message);
   }
   if (lastError && lastStatus) {
@@ -628,6 +639,15 @@ export function handleNoCredentials(
       model,
       lastStatus,
     });
+    if (isWebCookieProvider(provider)) {
+      const status =
+        lastStatus === HTTP_STATUS.UNAUTHORIZED || lastStatus === HTTP_STATUS.FORBIDDEN
+          ? HTTP_STATUS.UNAUTHORIZED
+          : lastStatus === HTTP_STATUS.RATE_LIMITED
+            ? HTTP_STATUS.RATE_LIMITED
+            : HTTP_STATUS.BAD_GATEWAY;
+      return channelErrorResponse(status, lastError, provider);
+    }
     return errorResponse(lastStatus, lastError);
   }
   if (!excludeConnectionId) {

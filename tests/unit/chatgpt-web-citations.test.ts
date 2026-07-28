@@ -10,12 +10,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { ChatGptWebExecutor, __resetChatGptWebCachesForTesting } = await import(
-  "../../open-sse/executors/chatgpt-web.ts"
-);
-const { __setTlsFetchOverrideForTesting } = await import(
-  "../../open-sse/services/chatgptTlsClient.ts"
-);
+const { ChatGptWebExecutor, __resetChatGptWebCachesForTesting } =
+  await import("../../open-sse/executors/chatgpt-web.ts");
+const { __setTlsFetchOverrideForTesting } =
+  await import("../../open-sse/services/chatgptTlsClient.ts");
 
 // ─── Minimal TLS-fetch mock ──────────────────────────────────────────────────
 // Tailored to the citation flow: root/DPL, session→accessToken, sentinel→token
@@ -182,6 +180,7 @@ test("Non-streaming: resolves ChatGPT web citation markers into markdown links",
     assert.equal(result.response.status, 200);
     const json = await result.response.json();
     const content = json.choices[0].message.content;
+    const annotations = json.choices[0].message.annotations;
     assert.match(
       content,
       /\[Tesla\]\(https:\/\/www\.tesla\.com\/en_au\/support\/autopilot\) FSD v14 is rolling out/
@@ -192,6 +191,24 @@ test("Non-streaming: resolves ChatGPT web citation markers into markdown links",
     );
     assert.match(content, /\[2\]\(https:\/\/example\.com\/owners\/fsd-v14\)/);
     assert.doesNotMatch(content, /|||turn0search/);
+    assert.deepEqual(
+      annotations.map((item: { url_citation: { url: string } }) => item.url_citation.url),
+      [
+        "https://www.tesla.com/en_au/support/autopilot",
+        "https://www.tesla.com/support/fsd-v14?utm_source=chatgpt.com",
+        "https://example.com/owners/fsd-v14",
+      ]
+    );
+    assert.ok(
+      annotations.every(
+        (item: { type: string; url_citation: { start_index: number; end_index: number } }) =>
+          item.type === "url_citation" &&
+          item.url_citation.end_index > item.url_citation.start_index
+      )
+    );
+    assert.equal(json.omniroute.channel, "chatgpt-web");
+    assert.equal(json.omniroute.upstream_model, "gpt-5.5-pro-extended");
+    assert.equal(json.omniroute.quality, "ok");
   } finally {
     m.restore();
   }
@@ -382,6 +399,17 @@ test("GPT-5.5 Pro non-streaming: stream_handoff polls conversation detail for fi
       json.choices[0].message.content,
       "👉 Final full Pro answer. [1](https://example.com/pro-source)"
     );
+    assert.deepEqual(json.choices[0].message.annotations, [
+      {
+        type: "url_citation",
+        url_citation: {
+          url: "https://example.com/pro-source",
+          title: "Polled Pro source",
+          start_index: "👉 Final full Pro answer. ".length,
+          end_index: "👉 Final full Pro answer. [1](https://example.com/pro-source)".length,
+        },
+      },
+    ]);
     assert.equal(m.calls.conversationDetail, 1);
     const convIdx = m.calls.urls.findIndex((u) => u.endsWith("/backend-api/f/conversation"));
     const sentBody = JSON.parse(m.calls.bodies[convIdx]);

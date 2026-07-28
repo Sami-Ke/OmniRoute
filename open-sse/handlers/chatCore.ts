@@ -35,6 +35,10 @@ import {
   resolveAccountSemaphoreKey,
   resolveAccountSemaphoreMaxConcurrency,
   buildClaudePromptCacheLogMeta,
+  isWebCookieProvider,
+  enforceWebCookieStreamMode,
+  WEB_ACCOUNT_MAX_QUEUE_SIZE,
+  WEB_ACCOUNT_QUEUE_TIMEOUT_MS,
 } from "./chatCore/executorHelpers.ts";
 import {
   shouldUseNativeCodexPassthrough,
@@ -295,6 +299,7 @@ import {
   markBlocked as markAccountSemaphoreBlocked,
 } from "../services/accountSemaphore.ts";
 import { lockModel, lockModelIfPerModelQuota } from "../services/accountFallback.ts";
+import { waitForWebAccountTurn } from "../services/webAccountScheduler.ts";
 import {
   generateSignature,
   getCachedResponse,
@@ -984,13 +989,14 @@ export async function handleChatCore({
   // flag into resolveStreamFlag would force `stream=true` and skip that
   // conversion, yielding STREAM_EARLY_EOF for JSON callers. (#2081, #6126)
   const providerRequiresStreaming = REGISTRY[provider]?.forceStream === true;
-  const stream =
+  const resolvedStream =
     nativeCodexPassthrough && isCompactResponsesEndpoint(endpointPath)
       ? false
       : resolveStreamFlag(body?.stream, acceptHeader, sourceFormat, {
           userAgent: streamUserAgent,
           streamDefaultMode: apiKeyInfo?.streamDefaultMode,
         });
+  const stream = enforceWebCookieStreamMode(provider, body?.stream, resolvedStream);
 
   // `settings` is already consolidated once near the top of handleChatCore
   // (the "fetch once, reuse" const). A second `const settings` here was a
@@ -2710,7 +2716,11 @@ export async function handleChatCore({
             });
             const execCreds = getExecutionCredentials();
             const attemptConnectionId = execCreds?.connectionId || connectionId;
-            const accountSemaphoreMaxConcurrency = resolveAccountSemaphoreMaxConcurrency(execCreds);
+            const webCookieProvider = isWebCookieProvider(provider);
+            const accountSemaphoreMaxConcurrency = resolveAccountSemaphoreMaxConcurrency(
+              execCreds,
+              provider
+            );
             const accountSemaphoreKey = resolveAccountSemaphoreKey({
               provider,
               model: modelToCall,
@@ -2732,14 +2742,26 @@ export async function handleChatCore({
                 ? await acquireAccountSemaphore(accountSemaphoreKey, {
                     maxConcurrency: accountSemaphoreMaxConcurrency,
                     signal: streamController.signal,
+                    ...(webCookieProvider
+                      ? {
+                          timeoutMs: WEB_ACCOUNT_QUEUE_TIMEOUT_MS,
+                          maxQueueSize: WEB_ACCOUNT_MAX_QUEUE_SIZE,
+                        }
+                      : {}),
                   })
                 : () => {};
             trace("post_semaphore");
-            updatePendingScope(pendingScope, {
-              stage: "waiting_rate_limit",
-            });
 
             try {
+              if (webCookieProvider && accountSemaphoreKey) {
+                updatePendingScope(pendingScope, {
+                  stage: "waiting_web_account_interval",
+                });
+                await waitForWebAccountTurn(accountSemaphoreKey, streamController.signal);
+              }
+              updatePendingScope(pendingScope, {
+                stage: "waiting_rate_limit",
+              });
               trace("pre_rate_limit", { connectionId: attemptConnectionId });
               const rawExecutorResult = await withRateLimit(
                 provider,

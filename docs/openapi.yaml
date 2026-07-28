@@ -1592,6 +1592,39 @@ paths:
                     items:
                       $ref: "#/components/schemas/Model"
 
+  /api/v1/channels:
+    get:
+      tags: [System]
+      summary: Inspect web-cookie channel health
+      description: >-
+        Returns health, UTC-day usage, account-pool pressure, breaker state, and
+        the latest sanitized error for each web-cookie provider. Remaining web
+        subscription quota cannot be read reliably from every upstream and is
+        therefore returned as `null`.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Web-cookie channel status list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, checked_at, data]
+                properties:
+                  object:
+                    type: string
+                    example: list
+                  checked_at:
+                    type: string
+                    format: date-time
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WebChannelStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/v1/providers/{provider}/models:
     get:
       tags: [Models]
@@ -7132,6 +7165,13 @@ components:
                     type: string
                   content:
                     type: string
+                  annotations:
+                    type: array
+                    description: >-
+                      Always present on non-streaming web-cookie channel responses.
+                      Empty when no URL citation could be recovered.
+                    items:
+                      $ref: "#/components/schemas/UrlCitationAnnotation"
               finish_reason:
                 type: string
         usage:
@@ -7143,6 +7183,105 @@ components:
               type: integer
             total_tokens:
               type: integer
+        omniroute:
+          $ref: "#/components/schemas/WebResponseObservability"
+
+    UrlCitationAnnotation:
+      type: object
+      required: [type, url_citation]
+      properties:
+        type:
+          type: string
+          enum: [url_citation]
+        url_citation:
+          type: object
+          required: [url, title, start_index, end_index]
+          properties:
+            url:
+              type: string
+              format: uri
+            title:
+              type: string
+            start_index:
+              type: integer
+              minimum: 0
+            end_index:
+              type: integer
+              minimum: 0
+
+    WebResponseObservability:
+      type: object
+      description: Present on non-streaming web-cookie channel responses.
+      required: [channel, upstream_model, account, fallback_used, quality]
+      properties:
+        channel:
+          type: string
+          example: gemini-web
+        upstream_model:
+          type: string
+          example: gemini-3.5-flash
+        account:
+          type: string
+          description: Stable opaque pool label; never an email or connection id.
+          example: pool-k8w3s2
+        fallback_used:
+          type: boolean
+        quality:
+          type: string
+          enum: [ok, degraded]
+
+    WebChannelStatus:
+      type: object
+      required: [channel, status, today, accounts, breaker]
+      properties:
+        channel:
+          type: string
+          example: chatgpt-web
+        status:
+          type: string
+          enum: [healthy, degraded, down]
+        today:
+          type: object
+          properties:
+            used:
+              type: integer
+            successful:
+              type: integer
+            remaining_estimate:
+              type: integer
+              nullable: true
+              description: Null when the upstream does not expose a reliable remaining quota.
+            timezone:
+              type: string
+              example: UTC
+        accounts:
+          type: object
+          properties:
+            configured:
+              type: integer
+            active:
+              type: integer
+            cooling_or_terminal:
+              type: integer
+            running:
+              type: integer
+            queued:
+              type: integer
+        breaker:
+          type: object
+          properties:
+            state:
+              type: string
+              enum: [CLOSED, HALF_OPEN, OPEN]
+            retry_after_ms:
+              type: integer
+        last_error:
+          type: string
+          nullable: true
+        last_error_at:
+          type: string
+          format: date-time
+          nullable: true
 
     MessagesRequest:
       type: object

@@ -290,8 +290,8 @@ test("handleNoCredentials returns Retry-After when every account is rate limited
       lastError: "Quota exceeded",
     },
     "conn_123",
-    "openai",
-    "gpt-4o-mini",
+    "chatgpt-web",
+    "gpt-5.5",
     null,
     null
   );
@@ -299,7 +299,9 @@ test("handleNoCredentials returns Retry-After when every account is rate limited
 
   assert.equal(response.status, 429);
   assert.ok(Number(response.headers.get("Retry-After")) >= 1);
-  assert.match(json.error.message, /\[openai\/gpt-4o-mini\] Quota exceeded/);
+  assert.match(json.error.message, /\[chatgpt-web\/gpt-5.5\] Quota exceeded/);
+  assert.equal(json.error.code, "QUOTA_EXHAUSTED");
+  assert.equal(json.error.channel, "chatgpt-web");
 });
 
 test("handleNoCredentials returns structured model_cooldown when every credential for the model is cooling down", async () => {

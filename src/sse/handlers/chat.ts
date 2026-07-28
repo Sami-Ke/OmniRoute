@@ -147,6 +147,7 @@ import {
 } from "../services/cooldownAwareRetry";
 import { constrainConnectionsToQuota, resolveQuotaKeyScope } from "../../lib/quota/quotaKey";
 import { checkConnectionCapacity } from "../utils/backpressure";
+import { isWebCookieProvider } from "@omniroute/open-sse/handlers/chatCore/executorHelpers.ts";
 
 registerCodexQuotaFetcher();
 
@@ -225,6 +226,42 @@ function intersectAllowedConnectionIds(primary: unknown, secondary: unknown): st
   }
 
   return first || second || null;
+}
+
+async function isDegradedWebResponse(response: Response): Promise<boolean> {
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("application/json")) return false;
+  try {
+    const body = (await response.clone().json()) as {
+      omniroute?: { quality?: unknown };
+    };
+    return body.omniroute?.quality === "degraded";
+  } catch {
+    return false;
+  }
+}
+
+async function withWebFallbackMetadata(
+  response: Response,
+  fallbackUsed: boolean
+): Promise<Response> {
+  if (!fallbackUsed) return response;
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("application/json")) return response;
+  try {
+    const body = (await response.clone().json()) as {
+      omniroute?: Record<string, unknown>;
+    };
+    if (!body.omniroute) return response;
+    body.omniroute.fallback_used = true;
+    return new Response(JSON.stringify(body), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch {
+    return response;
+  }
 }
 
 const comboPromoteDeps = { updateCombo, info: log.info, warn: log.warn };
@@ -1237,6 +1274,8 @@ async function handleSingleModelChat(
   // re-attempt to exactly one for the whole request. Declared outside both retry
   // loops so it can never reset and loop.
   let streamEarlyEofRetries = 0;
+  let degradedFallbackResponse: Response | null = null;
+  let qualityRetryRemaining = true;
 
   requestAttemptLoop: while (true) {
     const excludedConnectionIds = new Set<string>();
@@ -1277,6 +1316,13 @@ async function handleSingleModelChat(
       preselectedCredentials = null;
 
       if (!credentials || "allRateLimited" in credentials || !credentials.connectionId) {
+        if (degradedFallbackResponse) {
+          if (qualityRetryRemaining) {
+            qualityRetryRemaining = false;
+            continue requestAttemptLoop;
+          }
+          return withWebFallbackMetadata(degradedFallbackResponse, true);
+        }
         if (credentials?.allRateLimited) {
           const retryDecision = getCooldownAwareRetryDecision({
             retryAfter: credentials.retryAfter,
@@ -1336,6 +1382,9 @@ async function handleSingleModelChat(
       }
 
       const accountId = credentials.connectionId.slice(0, 8);
+      if (degradedFallbackResponse && excludedConnectionIds.size > 0) {
+        qualityRetryRemaining = false;
+      }
       log.info("AUTH", `Using ${provider} account: ${accountId}...`);
       // #474: when the request used a bare model name (no "/" — e.g. an alias
       // that resolved to "auto") and the selected connection declares a
@@ -1478,6 +1527,20 @@ async function handleSingleModelChat(
       });
 
       if (result.success) {
+        if (
+          isWebCookieProvider(provider) &&
+          !hasForcedConnection &&
+          qualityRetryRemaining &&
+          (await isDegradedWebResponse(result.response))
+        ) {
+          degradedFallbackResponse = result.response;
+          excludedConnectionIds.add(credentials.connectionId);
+          log.warn(
+            "WEB_QUALITY",
+            `${provider}/${model} response exceeded duplicate threshold; retrying once`
+          );
+          continue;
+        }
         clearModelLock(provider, credentials.connectionId, model);
         if (!forceLiveComboTest) {
           breaker._onSuccess();
@@ -1487,7 +1550,11 @@ async function handleSingleModelChat(
         }
         if (telemetry) telemetry.startPhase("finalize");
         if (telemetry) telemetry.endPhase();
-        return result.response;
+        return withWebFallbackMetadata(
+          result.response,
+          isWebCookieProvider(provider) &&
+            (excludedConnectionIds.size > 0 || degradedFallbackResponse !== null)
+        );
       }
 
       // Missing Cloud Code project assignment is an account configuration error, not a

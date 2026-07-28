@@ -17,6 +17,10 @@ import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
 import { buildToolModeResponse } from "./chatgptWebTools.ts";
+import {
+  buildWebResponseObservability,
+  extractUrlCitationsFromContent,
+} from "../services/webObservability.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -52,14 +56,35 @@ interface GeminiRequestBody {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function formatChatCompletion(content: string, model: string, finishReason = "stop") {
+function formatChatCompletion(
+  content: string,
+  model: string,
+  finishReason = "stop",
+  connectionId?: string | null
+) {
   return {
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: finishReason }],
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content,
+          annotations: extractUrlCitationsFromContent(content),
+        },
+        finish_reason: finishReason,
+      },
+    ],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    omniroute: buildWebResponseObservability({
+      channel: "gemini-web",
+      upstreamModel: model,
+      connectionId,
+      content,
+    }),
   };
 }
 
@@ -169,12 +194,16 @@ export async function buildGeminiToolResponse(
   stream: boolean,
   model: string,
   cid: string,
-  created: number
+  created: number,
+  connectionId?: string | null
 ): Promise<Response> {
-  const bufferedJson = new Response(JSON.stringify(formatChatCompletion(responseText, model)), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
+  const bufferedJson = new Response(
+    JSON.stringify(formatChatCompletion(responseText, model, "stop", connectionId)),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
   return buildToolModeResponse(bufferedJson, requestedTools, stream, {
     cid,
     created,
@@ -514,7 +543,8 @@ export class GeminiWebExecutor extends BaseExecutor {
           Boolean(stream),
           modelId,
           cid,
-          created
+          created,
+          credentials?.connectionId
         );
         return { response: toolResponse, url: GEMINI_URL, headers: {}, transformedBody: body };
       }
@@ -558,10 +588,15 @@ export class GeminiWebExecutor extends BaseExecutor {
       }
 
       return {
-        response: new Response(JSON.stringify(formatChatCompletion(responseText, modelId)), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
+        response: new Response(
+          JSON.stringify(
+            formatChatCompletion(responseText, modelId, "stop", credentials?.connectionId)
+          ),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }
+        ),
         url: GEMINI_URL,
         headers: {},
         transformedBody: body,

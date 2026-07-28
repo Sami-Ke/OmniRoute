@@ -610,17 +610,73 @@ export function unavailableResponse(
   statusCode: number,
   message: string,
   retryAfter?: string | number | Date | null,
-  retryAfterHuman?: string
+  retryAfterHuman?: string,
+  options?: { channel?: string | null; code?: string | null }
 ) {
   const retryAfterSec = normalizeRetryAfterSeconds(retryAfter);
   const msg = retryAfterHuman ? `${message} (${retryAfterHuman})` : message;
-  return new Response(JSON.stringify({ error: { message: msg } }), {
-    status: statusCode,
-    headers: {
-      "Content-Type": "application/json",
-      "Retry-After": String(retryAfterSec),
-    },
-  });
+  if (!options) {
+    return new Response(JSON.stringify({ error: { message: msg } }), {
+      status: statusCode,
+      headers: {
+        "Content-Type": "application/json",
+        "Retry-After": String(retryAfterSec),
+      },
+    });
+  }
+  const isQuota = statusCode === 429;
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: msg,
+        type: isQuota ? "rate_limit_error" : "upstream_error",
+        code: options?.code || (isQuota ? "QUOTA_EXHAUSTED" : "UPSTREAM_UNAVAILABLE"),
+        ...(options?.channel ? { channel: options.channel } : {}),
+      },
+    }),
+    {
+      status: statusCode,
+      headers: {
+        "Content-Type": "application/json",
+        "Retry-After": String(retryAfterSec),
+      },
+    }
+  );
+}
+
+export function channelErrorResponse(
+  statusCode: number,
+  message: string,
+  channel: string,
+  code?: string
+): Response {
+  const resolvedCode =
+    code ||
+    (statusCode === 401
+      ? "UPSTREAM_AUTH_FAILED"
+      : statusCode === 429
+        ? "QUOTA_EXHAUSTED"
+        : "UPSTREAM_FAILURE");
+  const type =
+    statusCode === 401
+      ? "authentication_error"
+      : statusCode === 429
+        ? "rate_limit_error"
+        : "upstream_error";
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: sanitizeErrorMessage(message) || getDefaultErrorMessage(statusCode),
+        type,
+        code: resolvedCode,
+        channel,
+      },
+    }),
+    {
+      status: statusCode,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
 }
 
 export function providerCircuitOpenResponse(

@@ -44,19 +44,24 @@ async function applyToolCallsToJsonResponse(
       idSeed
     );
     if (toolCalls) {
-      json.choices[0].message = { role: "assistant", content: null, tool_calls: toolCalls };
+      json.choices[0].message = {
+        ...json.choices[0].message,
+        role: "assistant",
+        content: null,
+        tool_calls: toolCalls,
+      };
       json.choices[0].finish_reason = finishReason;
     } else {
       json.choices[0].message.content = content;
     }
     return new Response(JSON.stringify(json), {
       status: response.status,
-      headers: { "Content-Type": "application/json" },
+      headers: response.headers,
     });
   } catch {
     return new Response(bodyText, {
       status: response.status,
-      headers: { "Content-Type": "application/json" },
+      headers: response.headers,
     });
   }
 }

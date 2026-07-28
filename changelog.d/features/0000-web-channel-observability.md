@@ -1,0 +1,1 @@
+- **feat(web-providers):** Add OpenAI-compatible URL citation annotations, response quality metadata and retry, per-account browser-channel serialization with jitter, structured quota/upstream errors, and authenticated `/v1/channels` health reporting for web-cookie provider pools.

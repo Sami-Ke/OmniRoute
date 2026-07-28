@@ -249,3 +249,8 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
   npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code droid openclaw@latest
 
 USER node
+
+# Zeabur builds the final stage when this repository is uploaded directly.
+# Keep the browser-enabled runtime as that final stage so Gemini Web and
+# browser-assisted Claude Web authentication continue to work in production.
+FROM runner-web AS zeabur-runtime

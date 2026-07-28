@@ -33,7 +33,8 @@ import {
   type ChatGptImageConversationContext,
 } from "../services/chatgptImageCache.ts";
 import { isThinkingCapableModel, resolveChatGptModel } from "./chatgpt-web/models.ts";
-import { cleanChatGptText } from "./chatgpt-web/citations.ts";
+import { cleanChatGptText, renderChatGptTextWithAnnotations } from "./chatgpt-web/citations.ts";
+import { buildWebResponseObservability } from "../services/webObservability.ts";
 import { resumeChatGptHandoff, type FinalAssistantAnswer } from "./chatgpt-web/handoff.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -2015,6 +2016,7 @@ async function buildNonStreamingResponse(
     ((conversationId: string, resumeToken: string) => Promise<FinalAssistantAnswer | null>) | null,
   pollFinalAnswer: ((conversationId: string) => Promise<FinalAssistantAnswer | null>) | null,
   log: { warn?: (tag: string, msg: string) => void } | null,
+  connectionId?: string | null,
   signal?: AbortSignal | null
 ): Promise<Response> {
   let fullAnswer = "";
@@ -2079,7 +2081,8 @@ async function buildNonStreamingResponse(
     }
   }
 
-  fullAnswer = cleanChatGptText(fullAnswer, answerMetadata);
+  const renderedAnswer = renderChatGptTextWithAnnotations(fullAnswer, answerMetadata);
+  fullAnswer = renderedAnswer.content;
 
   // Async image gen: SSE ended with "Processing image..." — poll for the
   // final pointer the same way the streaming path does.
@@ -2139,7 +2142,11 @@ async function buildNonStreamingResponse(
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: fullAnswer },
+          message: {
+            role: "assistant",
+            content: fullAnswer,
+            annotations: renderedAnswer.annotations,
+          },
           finish_reason: "stop",
           logprobs: null,
         },
@@ -2149,6 +2156,12 @@ async function buildNonStreamingResponse(
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
       },
+      omniroute: buildWebResponseObservability({
+        channel: "chatgpt-web",
+        upstreamModel: model,
+        connectionId,
+        content: fullAnswer,
+      }),
     }),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
@@ -2697,9 +2710,10 @@ async function pollForAsyncImage(
         const message = node?.message;
         const parts = message?.content?.parts;
         if (!Array.isArray(parts)) continue;
-        const pointers = extractImagePointers(parts).map(
-          (pointer) => ({ pointer, messageId: message?.id })
-        );
+        const pointers = extractImagePointers(parts).map((pointer) => ({
+          pointer,
+          messageId: message?.id,
+        }));
         if (pointers.length === 0) continue;
         const at = message?.create_time ?? 0;
         if (!newest || at >= newest.at) newest = { pointers, at };
@@ -3173,6 +3187,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
         resumeFinalAnswer,
         pollFinalAnswer,
         log,
+        credentials?.connectionId,
         signal
       );
       finalResponse = new Response(sseStream, {

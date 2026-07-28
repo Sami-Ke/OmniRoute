@@ -1,3 +1,8 @@
+import {
+  extractUrlCitationsFromContent,
+  type UrlCitationAnnotation,
+} from "../../services/webObservability.ts";
+
 // Pure ChatGPT-web citation-marker parsing/rendering, extracted verbatim from
 // chatgpt-web.ts (no module state — safe to unit test in isolation).
 //
@@ -392,4 +397,46 @@ function applyChatGptCitations(text: string, metadata?: Record<string, unknown>)
 
 export function cleanChatGptText(text: string, metadata?: Record<string, unknown>): string {
   return applyChatGptCitations(text.replace(ENTITY_RE, "$1"), metadata);
+}
+
+/**
+ * Render ChatGPT's private citation markers and expose the same sources through
+ * the OpenAI Chat Completions `message.annotations` shape.
+ */
+export function renderChatGptTextWithAnnotations(
+  text: string,
+  metadata?: Record<string, unknown>
+): { content: string; annotations: UrlCitationAnnotation[] } {
+  const citationData = collectChatGptCitationData(metadata);
+  const content = applyChatGptCitations(text.replace(ENTITY_RE, "$1"), metadata);
+  const sourceByCanonicalUrl = new Map(
+    citationData.sources.map((source) => [canonicalCitationUrl(source.url), source])
+  );
+  const annotations = extractUrlCitationsFromContent(content).map((annotation) => {
+    const source = sourceByCanonicalUrl.get(canonicalCitationUrl(annotation.url_citation.url));
+    return source
+      ? {
+          ...annotation,
+          url_citation: { ...annotation.url_citation, title: source.title },
+        }
+      : annotation;
+  });
+  const seen = new Set(
+    annotations.map((annotation) => canonicalCitationUrl(annotation.url_citation.url))
+  );
+  for (const source of citationData.sources) {
+    const canonical = canonicalCitationUrl(source.url);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    annotations.push({
+      type: "url_citation",
+      url_citation: {
+        url: source.url,
+        title: source.title,
+        start_index: 0,
+        end_index: 0,
+      },
+    });
+  }
+  return { content, annotations };
 }

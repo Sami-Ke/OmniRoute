@@ -1,6 +1,26 @@
 import { FORMATS } from "../../translator/formats.ts";
 import { buildAccountSemaphoreKey } from "../../services/accountSemaphore.ts";
 import { getHeaderValueCaseInsensitive } from "./headers.ts";
+import { WEB_COOKIE_PROVIDERS } from "@/shared/constants/providers";
+
+export const WEB_ACCOUNT_QUEUE_TIMEOUT_MS = 10 * 60_000;
+export const WEB_ACCOUNT_MAX_QUEUE_SIZE = 100;
+
+export function isWebCookieProvider(provider: string | null | undefined): boolean {
+  return Boolean(
+    provider &&
+    Object.prototype.hasOwnProperty.call(WEB_COOKIE_PROVIDERS as Record<string, unknown>, provider)
+  );
+}
+
+export function enforceWebCookieStreamMode(
+  provider: string | null | undefined,
+  requestedStream: unknown,
+  resolvedStream: boolean
+): boolean {
+  if (!isWebCookieProvider(provider)) return resolvedStream;
+  return requestedStream === true;
+}
 
 function toFiniteNumberOrNull(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -39,8 +59,10 @@ export function resolveAccountSemaphoreAccountKey(
 }
 
 export function resolveAccountSemaphoreMaxConcurrency(
-  credentials: Record<string, unknown> | null | undefined
+  credentials: Record<string, unknown> | null | undefined,
+  provider?: string | null
 ): number | null {
+  if (isWebCookieProvider(provider)) return 1;
   return toFiniteNumberOrNull(credentials?.maxConcurrent);
 }
 
