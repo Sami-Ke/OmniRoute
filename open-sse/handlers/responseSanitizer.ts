@@ -297,6 +297,14 @@ export function sanitizeOpenAIResponse(
     sanitized.system_fingerprint = bodyRecord.system_fingerprint;
   }
 
+  // OmniRoute web-provider observability is an intentional, documented
+  // extension of the OpenAI-compatible response. Preserve it while continuing
+  // to strip unrelated upstream-specific top-level fields.
+  const omniroute = toRecord(bodyRecord.omniroute);
+  if (omniroute) {
+    sanitized.omniroute = { ...omniroute };
+  }
+
   return sanitized;
 }
 
@@ -453,6 +461,12 @@ function sanitizeMessage(msg: unknown, options: ParseOptions = {}): unknown {
 
   if (msgRecord.function_call) {
     sanitized.function_call = stripZeroWidthFunctionArguments(msgRecord.function_call);
+  }
+
+  // `annotations` is part of OpenAI's assistant-message citation shape. Web
+  // providers populate it with normalized `url_citation` entries.
+  if (Array.isArray(msgRecord.annotations)) {
+    sanitized.annotations = msgRecord.annotations;
   }
 
   return sanitized;
