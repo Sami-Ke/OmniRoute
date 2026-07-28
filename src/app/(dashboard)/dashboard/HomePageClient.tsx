@@ -93,6 +93,17 @@ function normalizeProviderId(providerId?: string | null): string {
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function fetchWithTimeout(input: RequestInfo | URL, timeoutMs = 10_000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(input, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function mergeUpdateStep(steps: UpdateStep[], nextStep: UpdateStep) {
   const idx = steps.findIndex((step) => step.step === nextStep.step);
   if (idx === -1) {
@@ -253,9 +264,9 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   const fetchData = useCallback(async () => {
     try {
       const [provRes, modelsRes, versionRes] = await Promise.all([
-        fetch("/api/providers"),
-        fetch("/api/models"),
-        fetch("/api/system/version"),
+        fetchWithTimeout("/api/providers"),
+        fetchWithTimeout("/api/models"),
+        fetchWithTimeout("/api/system/version"),
       ]);
       if (provRes.ok) {
         const provData = await provRes.json();

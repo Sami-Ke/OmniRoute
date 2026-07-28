@@ -7,7 +7,7 @@
    the layout. Bundling the font locally removes that runtime CDN dependency.
    The bundled @font-face uses family "Material Symbols Outlined", matching the
    .material-symbols-outlined rule defined later in this file. */
-@import "material-symbols/outlined.css";
+@import "@material-symbols/font-400/outlined.css";
 @source "../../node_modules/fumadocs-ui/css/generated/*.css";
 
 /* Tailwind v4 auto-detection cannot scan directories with parentheses
