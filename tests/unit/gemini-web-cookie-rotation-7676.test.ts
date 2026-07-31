@@ -27,32 +27,44 @@ test("#7676: GeminiWebExecutor persists rotated __Secure-1PSIDTS/__Secure-1PSIDC
       newContext: async () => ({
         addCookies: async () => {},
         cookies: async () => rotatedJarCookies,
-        newPage: async () => ({
-          on: (event: string, handler: (resp: { url: () => string; text: () => Promise<string> }) => void) => {
-            if (event === "response") {
-              const body =
-                ")]}'\n" +
-                "30\n" +
-                JSON.stringify([
-                  [
-                    "wrb.fr",
-                    null,
-                    JSON.stringify([null, null, null, null, [[null, ["hello back"]]]]),
-                  ],
-                ]) +
-                "\n";
-              handler({
-                url: () =>
-                  "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate",
-                text: async () => body,
-              });
-            }
-          },
-          goto: async () => {},
-          waitForTimeout: async () => {},
-          waitForSelector: async () => ({ click: async () => {} }),
-          keyboard: { type: async () => {}, press: async () => {} },
-        }),
+        newPage: async () => {
+          let composerValue = "";
+          return {
+            on: (
+              event: string,
+              handler: (resp: { url: () => string; text: () => Promise<string> }) => void
+            ) => {
+              if (event === "response") {
+                const body =
+                  ")]}'\n" +
+                  "30\n" +
+                  JSON.stringify([
+                    [
+                      "wrb.fr",
+                      null,
+                      JSON.stringify([null, null, null, null, [[null, ["hello back"]]]]),
+                    ],
+                  ]) +
+                  "\n";
+                handler({
+                  url: () =>
+                    "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate",
+                  text: async () => body,
+                });
+              }
+            },
+            goto: async () => {},
+            waitForTimeout: async () => {},
+            waitForSelector: async () => ({
+              click: async () => {},
+              fill: async (value: string) => {
+                composerValue = value;
+              },
+              evaluate: async () => composerValue,
+            }),
+            keyboard: { press: async () => {} },
+          };
+        },
       }),
       close: async () => {},
     }) as unknown as typeof originalLaunch;

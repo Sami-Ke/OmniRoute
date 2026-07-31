@@ -112,18 +112,24 @@ test("Normalizes a bare __Secure-1PSID value before adding browser cookies", asy
         addCookies: async (cookies: Array<{ name: string; value: string }>) => {
           addedCookies = cookies;
         },
-        newPage: async () => ({
-          on: () => {},
-          goto: async () => {},
-          waitForTimeout: async () => {},
-          waitForSelector: async () => ({
-            click: async () => {},
-          }),
-          keyboard: {
-            type: async () => {},
-            press: async () => {},
-          },
-        }),
+        newPage: async () => {
+          let composerValue = "";
+          return {
+            on: () => {},
+            goto: async () => {},
+            waitForTimeout: async () => {},
+            waitForSelector: async () => ({
+              click: async () => {},
+              fill: async (value: string) => {
+                composerValue = value;
+              },
+              evaluate: async () => composerValue,
+            }),
+            keyboard: {
+              press: async () => {},
+            },
+          };
+        },
       }),
       close: async () => {},
     }) as any;

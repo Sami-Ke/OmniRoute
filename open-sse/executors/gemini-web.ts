@@ -99,6 +99,103 @@ function formatStreamChunk(content: string, model: string, finishReason: string 
 }
 
 /**
+ * Normalize only browser/editor representation differences that do not change
+ * the user's prompt. This deliberately does not trim ordinary whitespace:
+ * composer verification must catch real truncation or mutation.
+ */
+export function normalizeGeminiComposerText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/\u200b/g, "");
+}
+
+/**
+ * Playwright fills contenteditable blank lines as `<div><br></div>`. Chromium
+ * exposes those through innerText as `2n - 1` newlines (two input newlines
+ * become three observed newlines, three become five). Accept that DOM-only
+ * representation while still rejecting an actually missing/truncated line.
+ */
+export function geminiComposerMatchesPrompt(prompt: string, observed: string): boolean {
+  const normalizedPrompt = normalizeGeminiComposerText(prompt);
+  const normalizedObserved = normalizeGeminiComposerText(observed);
+  if (normalizedObserved === normalizedPrompt) return true;
+
+  const contentEditableObserved = normalizedObserved.replace(/\n{3,}/g, (run) =>
+    "\n".repeat(Math.ceil(run.length / 2))
+  );
+  return contentEditableObserved === normalizedPrompt;
+}
+
+type GeminiComposerHandle = {
+  click(): Promise<void>;
+  fill(value: string): Promise<void>;
+  evaluate<T>(fn: (element: HTMLElement) => T): Promise<T>;
+};
+
+/**
+ * Fill Gemini's contenteditable composer atomically and read it back before
+ * submission. `keyboard.type()` cannot be used here: embedded newlines are
+ * emitted as keyboard events and Gemini treats the first one as Enter,
+ * submitting a truncated prompt.
+ */
+export async function fillAndVerifyGeminiPrompt(
+  inputEl: GeminiComposerHandle,
+  prompt: string
+): Promise<{ ok: boolean; observedLength: number }> {
+  await inputEl.click();
+  await inputEl.fill(prompt);
+
+  const observed = await inputEl.evaluate((element) => {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return element.value;
+    }
+    return element.innerText ?? element.textContent ?? "";
+  });
+
+  const normalizedObserved = normalizeGeminiComposerText(observed);
+  return {
+    ok: geminiComposerMatchesPrompt(prompt, observed),
+    observedLength: normalizedObserved.length,
+  };
+}
+
+function formatPromptMismatchResponse(
+  model: string,
+  connectionId: string | null | undefined,
+  expectedLength: number,
+  observedLength: number
+): Response {
+  const omniroute = buildWebResponseObservability({
+    channel: "gemini-web",
+    upstreamModel: model,
+    connectionId,
+    content: "",
+  });
+
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "Gemini Web composer did not preserve the complete prompt.",
+        type: "upstream_input_error",
+        code: "GEMINI_PROMPT_MISMATCH",
+        channel: "gemini-web",
+      },
+      omniroute: {
+        ...omniroute,
+        quality: "degraded",
+        input_expected_length: expectedLength,
+        input_observed_length: observedLength,
+      },
+    }),
+    {
+      status: 502,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+}
+
+/**
  * Flatten the OpenAI-style multi-turn `messages[]` into the single plain-text
  * prompt typed into the Gemini web UI (#8371).
  *
@@ -503,12 +600,26 @@ export class GeminiWebExecutor extends BaseExecutor {
       }
       await page.waitForTimeout(3000);
 
-      // Type and send message
-      const inputEl = await page.waitForSelector(".ql-editor, [contenteditable='true']", {
+      // Fill the whole prompt in one DOM operation. keyboard.type() turns an
+      // embedded newline into Enter in Gemini's editor, submitting only the
+      // first line and silently dropping the remainder.
+      const inputEl = (await page.waitForSelector(".ql-editor, [contenteditable='true']", {
         timeout: 10000,
-      });
-      await inputEl.click();
-      await page.keyboard.type(prompt, { delay: 10 });
+      })) as GeminiComposerHandle;
+      const inputVerification = await fillAndVerifyGeminiPrompt(inputEl, prompt);
+      if (!inputVerification.ok) {
+        return {
+          response: formatPromptMismatchResponse(
+            model || "gemini-2.5-pro",
+            credentials?.connectionId,
+            normalizeGeminiComposerText(prompt).length,
+            inputVerification.observedLength
+          ),
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: body,
+        };
+      }
       await page.waitForTimeout(300);
       await page.keyboard.press("Enter");
 

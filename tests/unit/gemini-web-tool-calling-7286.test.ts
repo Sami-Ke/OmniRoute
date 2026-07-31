@@ -210,11 +210,14 @@ async function withMockedGeminiBrowser<T>(
           },
           goto: async () => {},
           waitForTimeout: async () => {},
-          waitForSelector: async () => ({ click: async () => {} }),
-          keyboard: {
-            type: async (text: string) => {
+          waitForSelector: async () => ({
+            click: async () => {},
+            fill: async (text: string) => {
               typedPrompt.value = text;
             },
+            evaluate: async () => typedPrompt.value,
+          }),
+          keyboard: {
             press: async () => {
               if (respHandler) {
                 await respHandler({
