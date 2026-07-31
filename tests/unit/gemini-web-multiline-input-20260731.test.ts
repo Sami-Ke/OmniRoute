@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { GeminiWebExecutor, geminiComposerMatchesPrompt } =
+const { GeminiWebExecutor, geminiComposerMatchesPrompt, geminiComposerTextFromSnapshot } =
   await import("../../open-sse/executors/gemini-web.ts");
 
 function makeStreamGenerateRaw(text: string): string {
@@ -18,6 +18,20 @@ test("composer verification accepts Chromium's blank-line innerText representati
     false,
     "a genuinely truncated composer must still fail verification"
   );
+});
+
+test("composer verification reconstructs Gemini Quill paragraphs instead of lossy innerText", () => {
+  const first = "第一行指示";
+  const second = "第二行真正問題";
+  const prompt = `${first}\n\n${second}`;
+
+  const observed = geminiComposerTextFromSnapshot({
+    quillBlocks: [first, "", second],
+    fallbackText: `${first}\n\n\n\n\n${second}`,
+  });
+
+  assert.equal(observed, prompt);
+  assert.equal(geminiComposerMatchesPrompt(prompt, observed), true);
 });
 
 test("gemini-web fills and verifies a multiline prompt atomically before submitting", async () => {
@@ -53,7 +67,13 @@ test("gemini-web fills and verifies a multiline prompt atomically before submitt
             fill: async (value: string) => {
               composerValue = value;
             },
-            evaluate: async () => composerValue,
+            evaluate: async () => {
+              const [first, second] = composerValue.split("\n\n");
+              return {
+                quillBlocks: [first, "", second],
+                fallbackText: `${first}\n\n\n\n\n${second}`,
+              };
+            },
           }),
           keyboard: {
             type: async () => {

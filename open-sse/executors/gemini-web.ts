@@ -127,6 +127,25 @@ export function geminiComposerMatchesPrompt(prompt: string, observed: string): b
   return contentEditableObserved === normalizedPrompt;
 }
 
+export interface GeminiComposerSnapshot {
+  formValue?: string;
+  quillBlocks?: string[];
+  fallbackText: string;
+}
+
+/**
+ * Quill renders every logical line as a direct `<p>` child. Reading the
+ * editor's `innerText` is not reversible: Chromium exposes a single blank
+ * Quill paragraph as five newline characters. Reconstruct from those direct
+ * paragraph blocks instead, falling back to innerText for non-Quill editors.
+ */
+export function geminiComposerTextFromSnapshot(snapshot: GeminiComposerSnapshot | string): string {
+  if (typeof snapshot === "string") return snapshot;
+  if (typeof snapshot.formValue === "string") return snapshot.formValue;
+  if (Array.isArray(snapshot.quillBlocks)) return snapshot.quillBlocks.join("\n");
+  return snapshot.fallbackText;
+}
+
 type GeminiComposerHandle = {
   click(): Promise<void>;
   fill(value: string): Promise<void>;
@@ -146,13 +165,26 @@ export async function fillAndVerifyGeminiPrompt(
   await inputEl.click();
   await inputEl.fill(prompt);
 
-  const observed = await inputEl.evaluate((element) => {
+  const snapshot = await inputEl.evaluate((element): GeminiComposerSnapshot => {
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      return element.value;
+      return { formValue: element.value, fallbackText: element.value };
     }
-    return element.innerText ?? element.textContent ?? "";
+
+    const directChildren = Array.from(element.children);
+    const quillBlocks =
+      element.classList.contains("ql-editor") &&
+      directChildren.length > 0 &&
+      directChildren.every((child) => child.tagName === "P")
+        ? directChildren.map((child) => child.textContent ?? "")
+        : undefined;
+
+    return {
+      quillBlocks,
+      fallbackText: element.innerText ?? element.textContent ?? "",
+    };
   });
 
+  const observed = geminiComposerTextFromSnapshot(snapshot);
   const normalizedObserved = normalizeGeminiComposerText(observed);
   return {
     ok: geminiComposerMatchesPrompt(prompt, observed),
