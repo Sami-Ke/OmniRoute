@@ -1,8 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { getCopilotMode, extractAccessToken, sessionPoolKey, solveHashcash } =
-  await import("../../open-sse/executors/copilot-web.ts");
+const {
+  getCopilotMode,
+  extractAccessToken,
+  sessionPoolKey,
+  solveHashcash,
+  buildCopilotRequestHeaders,
+  getCopilotUserIdentityType,
+} = await import("../../open-sse/executors/copilot-web.ts");
 
 test("getCopilotMode maps known models to their Copilot modes", () => {
   assert.equal(getCopilotMode("copilot"), "chat");
@@ -34,13 +40,52 @@ test("extractAccessToken extracts token from cookie string", () => {
   assert.equal(extractAccessToken(`session=xyz; access_token=${token}; other=1`), token);
 });
 
+test("extractAccessToken extracts access_token before treating a long cookie string as a token", () => {
+  const token = "eyJhbGciOiJSUzI1NiJ9." + "x".repeat(180);
+  const cookie = `session=${"c".repeat(120)}; access_token=${token}; other=${"o".repeat(120)}`;
+  assert.equal(extractAccessToken(cookie), token);
+});
+
 test("extractAccessToken extracts Bearer token from Authorization header", () => {
   const token = "my-bearer-token";
   assert.equal(extractAccessToken(`Bearer ${token}`), token);
 });
 
+test("extractAccessToken extracts a long Bearer token from a pasted Authorization header", () => {
+  const token = "eyJhbGciOiJSUzI1NiJ9." + "x".repeat(180);
+  assert.equal(extractAccessToken(`Authorization: Bearer ${token}`), token);
+});
+
 test("extractAccessToken returns null for empty input", () => {
   assert.equal(extractAccessToken(""), null);
+});
+
+test("buildCopilotRequestHeaders includes the current consumer auth markers", () => {
+  const headers = buildCopilotRequestHeaders("access-token", {}, { contentType: true });
+
+  assert.equal(headers.Authorization, "Bearer access-token");
+  assert.equal(headers["x-search-uilang"], "en-us");
+  assert.equal(headers["x-useridentitytype"], "google");
+  assert.equal(headers["Content-Type"], "application/json");
+  assert.equal(headers.Cookie, undefined);
+});
+
+test("buildCopilotRequestHeaders supports per-connection identity, UA, and session cookies", () => {
+  const headers = buildCopilotRequestHeaders(
+    "access-token",
+    {
+      userIdentityType: "microsoft",
+      searchUiLang: "zh-tw",
+      customUserAgent: "test-client/1.0",
+    },
+    { cookie: "_C_Auth=redacted" }
+  );
+
+  assert.equal(headers["x-useridentitytype"], "microsoft");
+  assert.equal(headers["x-search-uilang"], "zh-tw");
+  assert.equal(headers["User-Agent"], "test-client/1.0");
+  assert.equal(headers.Cookie, "_C_Auth=redacted");
+  assert.equal(getCopilotUserIdentityType({ userIdentityType: "bad\nvalue" }), "google");
 });
 
 test("sessionPoolKey produces unique keys per token preventing session sharing", () => {

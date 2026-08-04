@@ -122,7 +122,7 @@ export const WEB_COOKIE_PROVIDERS = {
     textIcon: "CP",
     website: "https://copilot.microsoft.com",
     authHint:
-      "Paste your access_token from copilot.microsoft.com (or export a .har file from DevTools while logged in)",
+      "Paste the access_token from copilot.microsoft.com DevTools → Network. Do not paste the full Cookie header.",
     subscriptionRisk: true,
     riskNoticeVariant: "webCookie",
   },
@@ -391,7 +391,7 @@ export const WEB_COOKIE_PROVIDERS = {
     riskNoticeVariant: "webCookie",
     authHint: "Paste the full Cookie header from chat.z.ai (must include the token=<JWT> cookie)",
   },
-  "promptql": {
+  promptql: {
     id: "promptql",
     alias: "pql",
     name: "PromptQL (Unofficial/Experimental)",

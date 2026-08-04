@@ -2538,14 +2538,16 @@ test("gemini-web validator: 500 → unavailable", async () => {
 test("copilot-web validator: valid access_token → 200", async () => {
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
-    if (target.includes("copilot.microsoft.com/c/api/conversations")) {
-      assert.match(
-        ((init.headers as Record<string, string>) || {}).Authorization || "",
-        /Bearer eyJhbGci/
-      );
-      return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
-    }
-    throw new Error(`unexpected fetch: ${target}`);
+    assert.equal(
+      target,
+      "https://copilot.microsoft.com/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup&features=anonymous-block-page&setflight=anonymous-block-page"
+    );
+    const headers = toPlainHeaders(init.headers);
+    assert.match(headers.Authorization || "", /Bearer eyJhbGci/);
+    assert.equal(headers["x-search-uilang"], "en-us");
+    assert.equal(headers["x-useridentitytype"], "google");
+    assert.equal(headers.Cookie, undefined);
+    return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
   };
 
   const result = await validateProviderApiKey({
@@ -2560,11 +2562,9 @@ test("copilot-web validator: valid access_token → 200", async () => {
 test("copilot-web validator: cookie with access_token= is extracted", async () => {
   let capturedAuth = "";
   globalThis.fetch = async (url, init = {}) => {
-    if (String(url).includes("copilot.microsoft.com")) {
-      capturedAuth = ((init.headers as Record<string, string>) || {}).Authorization || "";
-      return new Response(JSON.stringify({}), { status: 200 });
-    }
-    throw new Error(`unexpected fetch: ${String(url)}`);
+    assert.match(String(url), /copilot\.microsoft\.com\/c\/api\/conversations/);
+    capturedAuth = toPlainHeaders(init.headers).Authorization || "";
+    return new Response(JSON.stringify({}), { status: 200 });
   };
 
   await validateProviderApiKey({
@@ -2572,6 +2572,23 @@ test("copilot-web validator: cookie with access_token= is extracted", async () =
     apiKey: "access_token=eyJhbGciOiJIUzI1NiJ9.payload.sig; other_cookie=foo",
   });
   assert.equal(capturedAuth, "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig");
+});
+
+test("copilot-web validator: identity header can be overridden per connection", async () => {
+  globalThis.fetch = async (_url, init = {}) => {
+    const headers = toPlainHeaders(init.headers);
+    assert.equal(headers["x-useridentitytype"], "microsoft");
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "copilot-web",
+    apiKey: "valid-token",
+    providerSpecificData: { userIdentityType: "microsoft" },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
 });
 
 test("copilot-web validator: 401 → invalid token", async () => {
@@ -2583,7 +2600,7 @@ test("copilot-web validator: 401 → invalid token", async () => {
   });
 
   assert.equal(result.valid, false);
-  assert.match(result.error || "", /Invalid or expired access_token/i);
+  assert.match(result.error || "", /Copilot rejected the access_token/i);
 });
 
 test("copilot-web validator: 500 → unavailable", async () => {

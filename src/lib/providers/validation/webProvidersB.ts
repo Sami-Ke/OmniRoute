@@ -266,39 +266,34 @@ export async function validateCopilotWebProvider({ apiKey, providerSpecificData 
     if (!raw) {
       return {
         valid: false,
-        error: "Paste your access_token from copilot.microsoft.com DevTools → Cookies",
+        error: "Paste your access_token from copilot.microsoft.com DevTools → Network",
       };
     }
 
-    // Extract token — may be bare JWT, cookie string with access_token=, or Bearer prefix
-    const { extractAccessToken } = await import("@omniroute/open-sse/executors/copilot-web.ts");
+    // Extract token — may be a bare token, access_token=..., or Bearer prefix.
+    // The current Copilot web endpoint also requires the identity headers used
+    // by its own frontend, so keep validation and execution on the same helper.
+    const { extractAccessToken, buildCopilotRequestHeaders, COPILOT_CONVERSATIONS_URL } =
+      await import("@omniroute/open-sse/executors/copilot-web.ts");
     const token = extractAccessToken(raw);
     if (!token) {
       return { valid: false, error: "Could not extract access_token from input" };
     }
 
     // Probe Copilot's conversation API to verify token
-    const response = await validationWrite(
-      "https://copilot.microsoft.com/c/api/conversations?language=en",
-      {
-        method: "GET",
-        headers: applyCustomUserAgent(
-          {
-            Accept: "application/json",
-            Authorization: `Bearer ${token}`,
-            Origin: "https://copilot.microsoft.com",
-            Referer: "https://copilot.microsoft.com/",
-          },
-          providerSpecificData
-        ),
-      }
-    );
+    const response = await validationRead(COPILOT_CONVERSATIONS_URL, {
+      method: "GET",
+      headers: applyCustomUserAgent(
+        buildCopilotRequestHeaders(token, providerSpecificData),
+        providerSpecificData
+      ),
+    });
 
     if (response.status === 401 || response.status === 403) {
       return {
         valid: false,
         error:
-          "Invalid or expired access_token — re-paste from copilot.microsoft.com DevTools → Cookies",
+          "Copilot rejected the access_token — sign in again and copy a fresh token from DevTools → Network",
       };
     }
 
@@ -313,7 +308,10 @@ export async function validateCopilotWebProvider({ apiKey, providerSpecificData 
   }
 }
 
-export function extractM365CredentialParts(raw: string, providerSpecificData: Record<string, unknown>) {
+export function extractM365CredentialParts(
+  raw: string,
+  providerSpecificData: Record<string, unknown>
+) {
   const text = raw.trim();
   const parts: Record<string, string> = {};
 
@@ -332,9 +330,10 @@ export function extractM365CredentialParts(raw: string, providerSpecificData: Re
   if (/^wss:\/\//i.test(text)) {
     try {
       const url = new URL(text);
-      const hostOk = /^(?:[\w-]+\.)*(?:m365\.cloud\.microsoft|copilot\.microsoft\.com|substrate\.office\.com)$/i.test(
-        url.hostname
-      );
+      const hostOk =
+        /^(?:[\w-]+\.)*(?:m365\.cloud\.microsoft|copilot\.microsoft\.com|substrate\.office\.com)$/i.test(
+          url.hostname
+        );
       if (hostOk && url.pathname.startsWith("/m365Copilot/Chathub/")) {
         parts.access_token ||= url.searchParams.get("access_token") || "";
         parts.chathubPath ||= decodeURIComponent(
@@ -353,7 +352,9 @@ export function extractM365CredentialParts(raw: string, providerSpecificData: Re
       (typeof providerSpecificData.access_token === "string"
         ? providerSpecificData.access_token
         : "") ||
-      (typeof providerSpecificData.accessToken === "string" ? providerSpecificData.accessToken : ""),
+      (typeof providerSpecificData.accessToken === "string"
+        ? providerSpecificData.accessToken
+        : ""),
     chathubPath:
       parts.chathubPath ||
       parts.userTenant ||
@@ -365,10 +366,7 @@ export function extractM365CredentialParts(raw: string, providerSpecificData: Re
 }
 
 // ── Microsoft 365 Copilot Web token validator ──
-export async function validateCopilotM365WebProvider({
-  apiKey,
-  providerSpecificData = {},
-}: any) {
+export async function validateCopilotM365WebProvider({ apiKey, providerSpecificData = {} }: any) {
   const { accessToken, chathubPath } = extractM365CredentialParts(
     String(apiKey || ""),
     providerSpecificData

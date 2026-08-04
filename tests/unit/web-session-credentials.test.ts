@@ -31,7 +31,7 @@ test("web session credential metadata identifies cookie, token, and no-auth prov
   assert.deepEqual(webSessionCredentials.getWebSessionCredentialRequirement("copilot-web"), {
     kind: "token",
     credentialName: "access_token",
-    placeholder: "access_token=... or a DevTools HAR export",
+    placeholder: "access_token=... or paste the raw access_token value",
     acceptsFullCookieHeader: false,
     storageKeys: ["token", "access_token", "accessToken"],
   });

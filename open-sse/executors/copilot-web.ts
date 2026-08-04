@@ -5,8 +5,8 @@
  * session credentials, translating between OpenAI chat completions format
  * and Copilot's proprietary WebSocket event protocol.
  *
- * Auth: access_token from copilot.microsoft.com (extracted from browser
- * DevTools or HAR file). Anonymous access supported with limited models.
+ * Auth: access_token from copilot.microsoft.com (extracted from the browser's
+ * DevTools Network panel). Anonymous access is supported with limited models.
  *
  * Protocol:
  *   1. POST /c/api/start → conversationId
@@ -24,9 +24,81 @@ import { sanitizeErrorMessage } from "../utils/error.ts";
 const COPILOT_BASE = "https://copilot.microsoft.com";
 const COPILOT_START_URL = `${COPILOT_BASE}/c/api/start`;
 const COPILOT_WS_URL = "wss://copilot.microsoft.com/c/api/chat?api-version=2";
+export const COPILOT_CONVERSATIONS_URL =
+  `${COPILOT_BASE}/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup` +
+  "&features=anonymous-block-page&setflight=anonymous-block-page";
 
 const COPILOT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+
+// Copilot's consumer web surface currently requires this identity marker even
+// when the access token itself is valid. Keep it configurable for accounts
+// using another sign-in identity, while preserving the observed default for
+// the current consumer flow.
+export const COPILOT_DEFAULT_USER_IDENTITY_TYPE = "google";
+export const COPILOT_DEFAULT_SEARCH_UI_LANG = "en-us";
+
+type CopilotProviderSpecificData = Record<string, unknown> | null | undefined;
+
+function getSafeCopilotHeaderValue(
+  providerSpecificData: CopilotProviderSpecificData,
+  keys: string[],
+  fallback: string
+): string {
+  const data =
+    providerSpecificData && typeof providerSpecificData === "object" ? providerSpecificData : {};
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed && trimmed.length <= 128 && !/[\r\n]/.test(trimmed)) return trimmed;
+  }
+  return fallback;
+}
+
+export function getCopilotUserIdentityType(
+  providerSpecificData: CopilotProviderSpecificData = {}
+): string {
+  return getSafeCopilotHeaderValue(
+    providerSpecificData,
+    ["userIdentityType", "xUserIdentityType", "x-useridentitytype"],
+    COPILOT_DEFAULT_USER_IDENTITY_TYPE
+  );
+}
+
+export function getCopilotSearchUiLang(
+  providerSpecificData: CopilotProviderSpecificData = {}
+): string {
+  return getSafeCopilotHeaderValue(
+    providerSpecificData,
+    ["searchUiLang", "xSearchUiLang", "x-search-uilang"],
+    COPILOT_DEFAULT_SEARCH_UI_LANG
+  );
+}
+
+export function buildCopilotRequestHeaders(
+  accessToken?: string,
+  providerSpecificData: CopilotProviderSpecificData = {},
+  options: { cookie?: string; contentType?: boolean } = {}
+): Record<string, string> {
+  const customUserAgent = getSafeCopilotHeaderValue(
+    providerSpecificData,
+    ["customUserAgent"],
+    COPILOT_USER_AGENT
+  );
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "User-Agent": customUserAgent,
+    Origin: COPILOT_BASE,
+    Referer: `${COPILOT_BASE}/`,
+    "x-search-uilang": getCopilotSearchUiLang(providerSpecificData),
+    "x-useridentitytype": getCopilotUserIdentityType(providerSpecificData),
+  };
+  if (options.contentType) headers["Content-Type"] = "application/json";
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (options.cookie?.trim()) headers.Cookie = options.cookie.trim();
+  return headers;
+}
 
 // Model mapping: OmniRoute model ID → Copilot mode
 const MODEL_MODE_MAP: Record<string, string> = {
@@ -95,15 +167,18 @@ export function solveHashcash(parameter: string, difficulty: number): number | n
 
 export function extractAccessToken(credential: string): string | null {
   if (!credential) return null;
-  // Direct token
-  if (credential.startsWith("ey") || credential.length > 100) return credential;
-  // Try parsing as cookie string — look for _EDGE_S or similar
-  const match = credential.match(/access_token=([^;]+)/);
+  const value = credential.trim();
+  if (!value) return null;
+  // Parse wrappers before accepting a long value as a direct token. Full
+  // Cookie/Authorization strings are often longer than a JWT itself.
+  const match = value.match(/(?:^|[;\s])access_token=([^;\s]+)/i);
   if (match) return match[1];
-  // Try HAR-extracted bearer
-  const bearerMatch = credential.match(/[Bb]earer\s+(.+)/);
-  if (bearerMatch) return bearerMatch[1];
-  return credential;
+  // Try a pasted Authorization header
+  const bearerMatch = value.match(/(?:^|:\s*)Bearer\s+(.+)$/i);
+  if (bearerMatch) return bearerMatch[1].trim();
+  // Direct token
+  if (value.startsWith("ey") || value.length > 100) return value;
+  return value;
 }
 
 /**
@@ -156,7 +231,11 @@ export class CopilotWebExecutor extends BaseExecutor {
   /**
    * Get or create a session. Rotates when remainingTurns is low or blocked.
    */
-  private async getSession(accessToken?: string, signal?: AbortSignal): Promise<CopilotSession> {
+  private async getSession(
+    accessToken?: string,
+    signal?: AbortSignal,
+    providerSpecificData: CopilotProviderSpecificData = {}
+  ): Promise<CopilotSession> {
     const poolKey = sessionPoolKey(accessToken);
 
     const existing = sessionPool.get(poolKey);
@@ -175,7 +254,7 @@ export class CopilotWebExecutor extends BaseExecutor {
       sessionRotationCount = 0;
     }
 
-    const session = await this.createSession(accessToken, signal);
+    const session = await this.createSession(accessToken, signal, providerSpecificData);
     // Evict oldest entry if pool is at capacity (Map preserves insertion order)
     if (sessionPool.size >= MAX_POOL_SIZE) {
       sessionPool.delete(sessionPool.keys().next().value!);
@@ -188,16 +267,14 @@ export class CopilotWebExecutor extends BaseExecutor {
   /**
    * Create a fresh session with new cookies and conversationId.
    */
-  private async createSession(accessToken?: string, signal?: AbortSignal): Promise<CopilotSession> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "User-Agent": COPILOT_USER_AGENT,
-      Origin: COPILOT_BASE,
-      Referer: `${COPILOT_BASE}/`,
-    };
-    if (accessToken) {
-      headers["Authorization"] = `Bearer ${accessToken}`;
-    }
+  private async createSession(
+    accessToken?: string,
+    signal?: AbortSignal,
+    providerSpecificData: CopilotProviderSpecificData = {}
+  ): Promise<CopilotSession> {
+    const headers = buildCopilotRequestHeaders(accessToken, providerSpecificData, {
+      contentType: true,
+    });
 
     const res = await fetch(COPILOT_START_URL, {
       method: "POST",
@@ -242,7 +319,9 @@ export class CopilotWebExecutor extends BaseExecutor {
     prompt: string,
     mode: string,
     accessToken?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    providerSpecificData: CopilotProviderSpecificData = {},
+    sessionCookies = ""
   ): Promise<ReadableStream<Uint8Array>> {
     // Build WebSocket URL without credentials in query string
     const wsUrl = `${COPILOT_WS_URL}&clientSessionId=${crypto.randomUUID()}`;
@@ -289,23 +368,18 @@ export class CopilotWebExecutor extends BaseExecutor {
           signal?.addEventListener("abort", () => abort("Request aborted"), { once: true });
 
           try {
-            // Use Node.js built-in WebSocket if available, else dynamic import.
-            // Pass the access token via Authorization header (not URL) to avoid
-            // credential exposure in server logs.
-            let WS = globalThis.WebSocket;
-            if (!WS) {
-              // @ts-ignore — ws module has no type declarations in this project
-              WS = (await import("ws")).default as unknown as typeof WebSocket;
-              if (accessToken) {
-                // @ts-ignore — ws module supports headers option in second arg
-                ws = new WS(wsUrl, {
-                  headers: { Authorization: `Bearer ${accessToken}` },
-                }) as WebSocket;
-              }
-            }
-            if (!ws) {
-              ws = new WS(wsUrl) as WebSocket;
-            }
+            // Node's built-in WebSocket does not support custom handshake
+            // headers. Always use the ws package so the bearer, identity
+            // marker, and cookies from /c/api/start are actually sent.
+            // @ts-ignore — ws module's constructor options are broader than the
+            // DOM WebSocket type used by the event handlers below.
+            const WS = (await import("ws")).default as typeof WebSocket;
+            // @ts-ignore — ws supports the headers option in the second arg.
+            ws = new WS(wsUrl, {
+              headers: buildCopilotRequestHeaders(accessToken, providerSpecificData, {
+                cookie: sessionCookies,
+              }),
+            }) as WebSocket;
 
             const timeout = setTimeout(() => abort("Copilot WebSocket timeout"), FETCH_TIMEOUT_MS);
 
@@ -561,6 +635,7 @@ export class CopilotWebExecutor extends BaseExecutor {
     const rawCred =
       credentials?.apiKey || (credentials?.providerSpecificData?.cookie as string) || "";
     const accessToken = extractAccessToken(rawCred);
+    const providerSpecificData = credentials?.providerSpecificData || {};
 
     // Extract prompt from messages
     const messages = (body?.messages as Array<Record<string, unknown>>) || [];
@@ -595,7 +670,7 @@ export class CopilotWebExecutor extends BaseExecutor {
     let conversationId: string;
     let sessionCookies = "";
     try {
-      const session = await this.getSession(accessToken || undefined, signal);
+      const session = await this.getSession(accessToken || undefined, signal, providerSpecificData);
       conversationId = session.conversationId;
       sessionCookies = session.cookies;
     } catch (err) {
@@ -621,7 +696,9 @@ export class CopilotWebExecutor extends BaseExecutor {
           fullPrompt,
           mode,
           accessToken || undefined,
-          signal
+          signal,
+          providerSpecificData,
+          sessionCookies
         );
         const reader = wsStream.getReader();
         const decoder = new TextDecoder();
@@ -691,7 +768,9 @@ export class CopilotWebExecutor extends BaseExecutor {
         fullPrompt,
         mode,
         accessToken || undefined,
-        signal
+        signal,
+        providerSpecificData,
+        sessionCookies
       );
 
       return {
