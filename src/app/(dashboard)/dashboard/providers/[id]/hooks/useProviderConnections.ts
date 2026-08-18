@@ -533,15 +533,34 @@ export function useProviderConnections(
     }
   };
 
-  const handleRetestConnection = async (connectionId: string) => {
+  const handleRetestConnection = async (
+    connectionId: string,
+    mode: "auth" | "completion" = "auth"
+  ) => {
     if (!connectionId || retestingId) return;
     setRetestingId(connectionId);
     try {
-      const res = await fetch(`/api/providers/${connectionId}/test`, { method: "POST" });
+      const res = await fetch(`/api/providers/${connectionId}/test`, {
+        method: "POST",
+        ...(mode === "completion"
+          ? {
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ mode: "completion" }),
+            }
+          : {}),
+      });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         notify.error(data.error || t("failedRetestConnection"));
         return;
+      }
+      if (mode === "completion") {
+        const data = await res.json().catch(() => ({}) as any);
+        if (data.valid) {
+          notify.success(`${t("liveTestPassed")} · ${data.latencyMs}ms`);
+        } else {
+          notify.error(data.error || t("liveTestFailed"));
+        }
       }
       await fetchConnections();
     } catch (error) {

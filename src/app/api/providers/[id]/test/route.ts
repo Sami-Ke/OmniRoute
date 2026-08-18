@@ -32,6 +32,12 @@ import { CLI_RUNTIME_PROVIDER_MAP } from "./cliRuntimeProviderMap";
 /** POST body is optional; when present, only known fields are validated. */
 const providerConnectionTestBodySchema = z.object({
   validationModelId: z.string().max(500).optional(),
+  // "auth" (default) keeps the credential-only check; "completion" sends one real
+  // non-streaming chat completion pinned to this connection, catching upstreams
+  // that pass the auth probe but block actual conversations (e.g. chatgpt-web
+  // Sentinel/Turnstile on the conversation endpoint).
+  mode: z.enum(["auth", "completion"]).optional(),
+  completionModel: z.string().max(500).optional(),
 });
 
 function toSafeMessage(value: any, fallback = "Unknown error"): string {
@@ -788,6 +794,89 @@ export async function testSingleConnection(connectionId: string, validationModel
   };
 }
 
+/**
+ * mode:"completion" — run one real chat completion pinned to this connection and
+ * persist the outcome with the same testStatus/lastError semantics as the auth
+ * test. A connection whose credentials check out but whose real conversations
+ * are blocked (Sentinel 403, model gone, quota 402…) is marked accordingly, so
+ * the dashboard reflects what live traffic would actually get.
+ */
+export async function testSingleConnectionCompletion(
+  connectionId: string,
+  completionModel?: string | null
+) {
+  const connection = await getCachedProviderConnectionById(connectionId);
+  if (!connection) {
+    return { valid: false, error: "Connection not found" };
+  }
+  const provider = typeof connection.provider === "string" ? connection.provider : "";
+
+  let proxyInfo: any = null;
+  try {
+    proxyInfo = await resolveProxyForConnection(connectionId);
+  } catch (proxyErr: any) {
+    console.log(`[ConnectionTest] Failed to resolve proxy for ${connectionId}:`, proxyErr?.message);
+  }
+
+  const { runCompletionProbe } = await import("./completionProbe");
+  const probe = await runWithProxyContext(proxyInfo?.proxy || null, () =>
+    runCompletionProbe(connection, completionModel)
+  );
+
+  const now = new Date().toISOString();
+  const diagnosis = probe.valid
+    ? makeDiagnosis("ok", "upstream", null, null)
+    : classifyFailure({ error: probe.error, statusCode: probe.statusCode ?? undefined, provider });
+
+  const updateData: Record<string, any> = {
+    testStatus: probe.valid ? "active" : "error",
+    lastError: probe.valid ? null : probe.error,
+    lastErrorAt: probe.valid ? null : now,
+    lastTested: now,
+    lastErrorType: probe.valid ? null : diagnosis.type,
+    lastErrorSource: probe.valid ? null : diagnosis.source,
+    errorCode: probe.valid ? null : diagnosis.code || probe.statusCode || null,
+    rateLimitedUntil: probe.valid ? null : connection.rateLimitedUntil || null,
+  };
+  if (probe.valid) {
+    updateData.backoffLevel = 0;
+    try {
+      removeConnectionHealth(connectionId);
+    } catch {}
+  }
+  await updateProviderConnection(connectionId, updateData);
+
+  try {
+    saveCallLog({
+      method: "POST",
+      path: "/api/providers/test",
+      status: probe.valid ? 200 : probe.statusCode || 401,
+      model: "completion-test",
+      provider,
+      connectionId,
+      duration: probe.latencyMs,
+      error: probe.valid ? null : probe.error || null,
+      sourceFormat: "test",
+      targetFormat: "test",
+    }).catch(() => {});
+  } catch {}
+
+  return {
+    valid: probe.valid,
+    error: probe.error,
+    warning: null,
+    refreshed: false,
+    diagnosis,
+    latencyMs: probe.latencyMs,
+    statusCode: probe.statusCode,
+    runtime: null,
+    testedAt: now,
+    mode: "completion" as const,
+    probedModel: probe.model,
+    content: probe.content,
+  };
+}
+
 // POST /api/providers/[id]/test - Test connection
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -803,9 +892,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { validationModelId } = validation.data;
+    const { validationModelId, mode, completionModel } = validation.data;
 
-    const data = await testSingleConnection(id, validationModelId);
+    const data =
+      mode === "completion"
+        ? await testSingleConnectionCompletion(id, completionModel)
+        : await testSingleConnection(id, validationModelId);
 
     if (data.error === "Connection not found") {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });

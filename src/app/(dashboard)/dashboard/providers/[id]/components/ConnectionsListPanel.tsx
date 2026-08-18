@@ -54,7 +54,7 @@ type ConnectionsListPanelProps = {
   handleToggleCodexLimit: (id: string, type: "use5h" | "useWeekly", enabled: boolean) => void;
   handleToggleProxyEnabled: (id: string, enabled: boolean) => void;
   handleTogglePerKeyProxyEnabled: (id: string, enabled: boolean) => void;
-  handleRetestConnection: (id: string) => void;
+  handleRetestConnection: (id: string, mode?: "auth" | "completion") => void;
   handleRefreshToken: (id: string) => void;
   handleSwapPriority: (a: ConnectionRowConnection, b: ConnectionRowConnection) => void;
   handleBatchSetActive: (active: boolean) => void;
@@ -400,6 +400,7 @@ export default function ConnectionsListPanel({
                   handleToggleCodexLimit(conn.id, "useWeekly", enabled)
                 }
                 onRetest={() => handleRetestConnection(conn.id)}
+                onLiveTest={() => handleRetestConnection(conn.id, "completion")}
                 isRetesting={retestingId === conn.id}
                 onEdit={() => onOpenEditModal(conn)}
                 onDelete={() =>
@@ -595,6 +596,7 @@ export default function ConnectionsListPanel({
                       handleToggleCodexLimit(conn.id, "useWeekly", enabled)
                     }
                     onRetest={() => handleRetestConnection(conn.id)}
+                    onLiveTest={() => handleRetestConnection(conn.id, "completion")}
                     isRetesting={retestingId === conn.id}
                     onEdit={() => onOpenEditModal(conn)}
                     onDelete={() =>

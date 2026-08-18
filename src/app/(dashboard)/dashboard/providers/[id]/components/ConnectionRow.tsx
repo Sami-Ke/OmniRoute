@@ -75,6 +75,7 @@ export interface ConnectionRowProps {
   cliproxyapiEnabled?: boolean;
   onToggleCliproxyapiMode?: (enabled?: boolean) => void;
   onRetest: () => void;
+  onLiveTest?: () => void;
   isRetesting?: boolean;
   onEdit: () => void;
   onDelete: () => void;
@@ -358,6 +359,7 @@ export default function ConnectionRow({
   onToggleCodexWeekly,
   onToggleCliproxyapiMode,
   onRetest,
+  onLiveTest,
   isRetesting,
   onEdit,
   onDelete,
@@ -806,6 +808,20 @@ export default function ConnectionRow({
         >
           {t("retest")}
         </Button>
+        {onLiveTest && (
+          <Button
+            size="sm"
+            variant="ghost"
+            icon="bolt"
+            loading={isRetesting}
+            disabled={connection.isActive === false || isRetesting}
+            onClick={onLiveTest}
+            className="!h-7 !px-2 text-xs"
+            title={t("liveTestTitle")}
+          >
+            {t("liveTest")}
+          </Button>
+        )}
         {/* T12: Manual token refresh for OAuth accounts */}
         {onRefreshToken && (
           <Button
