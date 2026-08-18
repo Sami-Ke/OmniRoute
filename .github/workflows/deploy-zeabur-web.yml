@@ -3,7 +3,7 @@ name: Build Zeabur Web Image
 on:
   push:
     branches:
-      - codex-web-observability
+      - main
   workflow_dispatch:
 
 permissions:
