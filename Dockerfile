@@ -114,7 +114,14 @@ ENV OMNIROUTE_MITM_STUB=1
 # child (build-next-isolated.mjs → resolveNextBuildEnv spreads process.env).
 # Build-only; the runtime heap is set separately on the runner stage
 # (OMNIROUTE_MEMORY_MB). Override: `--build-arg OMNIROUTE_BUILD_MEMORY_MB=6144`.
-ARG OMNIROUTE_BUILD_MEMORY_MB=4096
+#
+# Ceiling must stay BELOW the builder's physical RAM. On a 4 GB builder (Zeabur
+# "Dev" spec) a 4096 ceiling let V8 grow its heap right up to the physical limit,
+# so the OS OOM-killed `next build` mid-run with NO error output (silent death at
+# "Creating an optimized production build ...") instead of V8 self-limiting. 3584
+# leaves ~512 MB headroom for Node/OS/other build processes, forcing V8 to GC
+# before it hits the physical wall. Raise via --build-arg on bigger builders.
+ARG OMNIROUTE_BUILD_MEMORY_MB=3584
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
 COPY . ./
