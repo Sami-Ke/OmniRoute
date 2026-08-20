@@ -77,7 +77,7 @@ RUN test -f package-lock.json \
 # a broken/rate-limited fetch fails the BUILD loudly instead of shipping a
 # broken image.
 RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
-  npm ci --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
+  npm ci --no-audit --no-fund --legacy-peer-deps --include=dev --ignore-scripts \
   && (cd node_modules/better-sqlite3 \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild) \
   && node -e "require('better-sqlite3')(':memory:').close()" \
