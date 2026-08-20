@@ -115,13 +115,21 @@ ENV OMNIROUTE_MITM_STUB=1
 # Build-only; the runtime heap is set separately on the runner stage
 # (OMNIROUTE_MEMORY_MB). Override: `--build-arg OMNIROUTE_BUILD_MEMORY_MB=6144`.
 #
-# Ceiling must stay BELOW the builder's physical RAM. On a 4 GB builder (Zeabur
-# "Dev" spec) a 4096 ceiling let V8 grow its heap right up to the physical limit,
-# so the OS OOM-killed `next build` mid-run with NO error output (silent death at
-# "Creating an optimized production build ...") instead of V8 self-limiting. 3584
-# leaves ~512 MB headroom for Node/OS/other build processes, forcing V8 to GC
-# before it hits the physical wall. Raise via --build-arg on bigger builders.
-ARG OMNIROUTE_BUILD_MEMORY_MB=3584
+# Memory-constrained builder (Zeabur "Dev" spec = 4 GB physical RAM):
+#
+# 1. Bundler: force the WEBPACK fallback (OMNIROUTE_USE_TURBOPACK=0). The default
+#    Turbopack bundler allocates native (Rust, off-V8-heap) memory that
+#    --max-old-space-size cannot bound (see scripts/build/build-next-isolated.mjs
+#    #6409), so on 4 GB it grew past physical RAM and the OS OOM-killed `next build`
+#    mid-run with NO error output (silent death right at "Creating an optimized
+#    production build ..."). Webpack's peak is V8-heap-bound, so the ceiling below
+#    actually caps it.
+# 2. Ceiling must stay BELOW physical RAM so V8 GCs before the OS kills it. 3700
+#    gives webpack's production pass room while leaving ~300 MB for Node/OS/native.
+#    Raise via --build-arg on bigger builders (and drop USE_TURBOPACK=0 to regain
+#    Turbopack's speed once RAM is no longer the constraint).
+ENV OMNIROUTE_USE_TURBOPACK=0
+ARG OMNIROUTE_BUILD_MEMORY_MB=3700
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
 COPY . ./
