@@ -170,6 +170,10 @@ const nextConfig = {
   // accept for image-bearing requests; tune via env if a deployment needs
   // more.
   experimental: {
+    // Reduce webpack's peak V8 usage on memory-constrained builders. Next.js
+    // keeps this opt-in because it is experimental, but it is designed for
+    // large production builds and only trades a small amount of compile time.
+    webpackMemoryOptimizations: true,
     serverActions: {
       bodySizeLimit: process.env.OMNIROUTE_SERVER_ACTIONS_BODY_LIMIT || "50mb",
     },
@@ -291,7 +295,14 @@ const nextConfig = {
     // TODO: Re-enable after fixing all sub-component useTranslations scope issues
     ignoreBuildErrors: true,
   },
-  webpack(config, { webpack }) {
+  webpack(config, { webpack, dev }) {
+    // The production filesystem cache retains the large module graph while the
+    // compiler is optimizing it. On the 4 GB Zeabur builder that retention is
+    // enough to push webpack past the available V8 heap; the build is slower
+    // without the cache but uses materially less peak memory.
+    if (config.cache && !dev) {
+      config.cache = false;
+    }
     config.ignoreWarnings = [
       ...(config.ignoreWarnings || []),
       isNextIntlExtractorDynamicImportWarning,
