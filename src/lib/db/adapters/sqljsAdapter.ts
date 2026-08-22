@@ -33,7 +33,7 @@ function resolveSqlJsWasmPath(): string {
   } catch {}
 
   for (const candidatePath of candidatePaths) {
-    if (fs.existsSync(candidatePath)) {
+    if (fs.existsSync(/* turbopackIgnore: true */ candidatePath)) {
       return candidatePath;
     }
   }
@@ -123,7 +123,10 @@ export async function createSqlJsAdapter(filePath: string): Promise<SqliteAdapte
   const SQLLib = await loadSqlJs();
   if (!SQLLib) throw new Error("[sqljsAdapter] Failed to load sql.js");
 
-  const buf = filePath !== ":memory:" && fs.existsSync(filePath) ? fs.readFileSync(filePath) : null;
+  const buf =
+    filePath !== ":memory:" && fs.existsSync(/* turbopackIgnore: true */ filePath)
+      ? fs.readFileSync(/* turbopackIgnore: true */ filePath)
+      : null;
   const db = new SQLLib.Database(buf ? new Uint8Array(buf) : undefined);
 
   let dirty = false;
@@ -133,7 +136,7 @@ export async function createSqlJsAdapter(filePath: string): Promise<SqliteAdapte
   function persist(): void {
     if (filePath === ":memory:") return;
     const data = db.export();
-    fs.writeFileSync(filePath, Buffer.from(data));
+    fs.writeFileSync(/* turbopackIgnore: true */ filePath, Buffer.from(data));
     dirty = false;
   }
 

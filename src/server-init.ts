@@ -1,6 +1,6 @@
 // Server startup script
 import initializeCloudSync from "./shared/services/initializeCloudSync";
-import { enforceWebRuntimeEnv } from "./lib/env/runtimeEnv";
+import { enforceWebRuntimeEnv } from "./lib/runtimeEnv";
 import { enforceSecrets } from "./shared/utils/secretsValidator";
 import { initAuditLog, cleanupExpiredLogs, logAuditEvent } from "./lib/compliance/index";
 import { initConsoleInterceptor } from "./lib/consoleInterceptor";

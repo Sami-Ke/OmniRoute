@@ -1,6 +1,7 @@
 import createNextIntlPlugin from "next-intl/plugin";
 import { createMDX } from "fumadocs-mdx/next";
-import { dirname } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mitmManagerAliasFor } from "./scripts/build/mitm-stub-flag.mjs";
 import { normalizeBasePath } from "./scripts/build/normalizeBasePath.mjs";
@@ -377,6 +378,29 @@ const nextConfig = {
         );
       }
     }
+
+    // Some Zeabur Linux builds reach webpack with TypeScript's `@/*` mapping
+    // present but without Next's JsConfigPathsPlugin resolving it. Rewrite only
+    // OmniRoute's internal `@/…` requests to an absolute source path before
+    // enhanced-resolve runs. The anchored slash keeps scoped packages such as
+    // `@omniroute/open-sse` outside this fallback and avoids replacing Next's
+    // own package aliases.
+    config.plugins.push(
+      new webpack.NormalModuleReplacementPlugin(/^@\/(.+)$/, (resource) => {
+        const sourcePath = resolve(projectRoot, "src", resource.request.slice(2));
+        const candidates = [
+          sourcePath,
+          `${sourcePath}.ts`,
+          `${sourcePath}.tsx`,
+          `${sourcePath}.js`,
+          `${sourcePath}.jsx`,
+          `${sourcePath}.mjs`,
+          `${sourcePath}.cjs`,
+          `${sourcePath}.json`,
+        ];
+        resource.request = candidates.find((candidate) => existsSync(candidate)) || sourcePath;
+      })
+    );
 
     return config;
   },

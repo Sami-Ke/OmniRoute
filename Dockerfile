@@ -77,7 +77,7 @@ RUN test -f package-lock.json \
 # a broken/rate-limited fetch fails the BUILD loudly instead of shipping a
 # broken image.
 RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
-  npm ci --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
+  npm ci --no-audit --no-fund --legacy-peer-deps --ignore-scripts --include=dev \
   && (cd node_modules/better-sqlite3 \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild) \
   && node -e "require('better-sqlite3')(':memory:').close()" \
@@ -85,15 +85,21 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
   && (test -n "$(find node_modules/tls-client-node/bin -mindepth 1 -print -quit 2>/dev/null)" \
       || (echo "tls-client-node native binary missing after postinstall — GitHub API fetch likely rate-limited or failed (#7802)" >&2 && exit 1))
 
-# Build with Turbopack (stable in Next 16, the repo default). The v3.8.27-era
+# Build with Webpack in the Docker image. Turbopack is stable in Next 16, but
+# its native Rust memory is not bounded by NODE_OPTIONS and reached ~8 GB on
+# this project; the Zeabur builder stalled while running the Turbopack pass.
+# Webpack is slower but has a deterministic V8 heap ceiling and completed the
+# full 659-page build with an 8 GB ceiling locally. Override with
+# `--build-arg OMNIROUTE_USE_TURBOPACK=1` when the builder has enough native
+# memory. The v3.8.27-era
 # TurbopackInternalError panic ("entered unreachable code: there must be a path to a
 # root" in ImportTracer::get_traces) no longer reproduces on Next 16.2.9 — validated
 # 2026-07-05 with clean amd64 (12min14s, image smoke-tested: /api/monitoring/health
-# 200) and arm64 (qemu, exit 0, zero panic strings) builds. Turbopack cut the bare
-# build from 17min to 9min on the same 32-core box. Webpack stays available as the
-# escape hatch: `--build-arg`/-e OMNIROUTE_USE_TURBOPACK=0.
+# 200) and arm64 (qemu, exit 0, zero panic strings) builds. Keep the override above
+# available for builders with sufficient native memory.
 # See docs/ops/QUALITY_GATE_PLAYBOOK.md Parte 6.
-ENV OMNIROUTE_USE_TURBOPACK=1
+ARG OMNIROUTE_USE_TURBOPACK=0
+ENV OMNIROUTE_USE_TURBOPACK=$OMNIROUTE_USE_TURBOPACK
 
 # Next.js basePath is fixed at build time; pass OMNIROUTE_BASE_PATH here when the
 # image should serve under a reverse-proxy subpath without a runtime patch.
@@ -113,11 +119,16 @@ ENV OMNIROUTE_MITM_STUB=1
 # on V8, so keep the ceiling. NODE_OPTIONS propagates to the spawned `next build`
 # child (build-next-isolated.mjs → resolveNextBuildEnv spreads process.env).
 # Build-only; the runtime heap is set separately on the runner stage
-# (OMNIROUTE_MEMORY_MB). Override: `--build-arg OMNIROUTE_BUILD_MEMORY_MB=6144`.
-ARG OMNIROUTE_BUILD_MEMORY_MB=4096
+# (OMNIROUTE_MEMORY_MB). Override with `--build-arg OMNIROUTE_BUILD_MEMORY_MB`.
+# The full 659-page Webpack build passes locally at 6144 MB; keeping the default
+# below 8 GB leaves headroom for the builder process and native install steps on
+# memory-constrained remote builders. 4 GB still reproduces an out-of-memory
+# failure on this project.
+ARG OMNIROUTE_BUILD_MEMORY_MB=6144
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
 COPY . ./
+RUN node -e 'const fs=require("node:fs"); const required=["tsconfig.json","next.config.mjs","src/shared/components/index.tsx","src/lib/oauth/gitlab.ts","src/shared/constants/claudeCodeClient.ts","src/lib/runtimeEnv.ts"]; const missing=required.filter((file)=>!fs.existsSync(file)); if(missing.length){throw new Error(`Docker build context missing: ${missing.join(", ")}`)} const ts=JSON.parse(fs.readFileSync("tsconfig.json","utf8")); if(ts.compilerOptions?.paths?.["@/*"]?.[0]!=="./src/*"){throw new Error("Docker build context has unexpected @/* path mapping")} console.log("[build-context] source and @/* mapping verified");'
 RUN --mount=type=cache,id=next-cache,target=/app/.build/next/cache \
   mkdir -p /app/data && npm run build
 

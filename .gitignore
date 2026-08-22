@@ -43,6 +43,7 @@ memory-bank/
 
 # Root-level underscore-prefixed directories (private/draft — never commit)
 /_*/
+/private/
 
 # Draft features documentation (internal only)
 docs/new-features/
@@ -87,6 +88,7 @@ next-env.d.ts
 # data and logs
 data/
 .data/
+.local-data/
 logs/*
 test_output.log
 
