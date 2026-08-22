@@ -92,6 +92,7 @@ import {
 } from "./reasoningRouting";
 import { createVirtualAutoCombo, resolveAutoRoutingState } from "./autoRouting";
 import { getComboFailureLogError } from "./comboFailureLogging";
+import type { ResponseProvenance } from "@omniroute/open-sse/translator/citationNormalizer.ts";
 
 // Pipeline integration — wired modules
 import { classify429FromError, type FailureKind } from "@/shared/utils/classify429";
@@ -253,7 +254,20 @@ async function withWebFallbackMetadata(
       omniroute?: Record<string, unknown>;
     };
     if (!body.omniroute) return response;
+    const existingProvenance =
+      body.omniroute.provenance &&
+      typeof body.omniroute.provenance === "object" &&
+      !Array.isArray(body.omniroute.provenance)
+        ? (body.omniroute.provenance as Record<string, unknown>)
+        : {};
     body.omniroute.fallback_used = true;
+    body.omniroute.provenance = {
+      ...existingProvenance,
+      fallback_used: true,
+      fallback_provider:
+        existingProvenance.fallback_provider ?? existingProvenance.upstream_provider,
+      fallback_model: existingProvenance.fallback_model ?? existingProvenance.upstream_model,
+    };
     return new Response(JSON.stringify(body), {
       status: response.status,
       statusText: response.statusText,
@@ -262,6 +276,17 @@ async function withWebFallbackMetadata(
   } catch {
     return response;
   }
+}
+
+function buildRequestedResponseProvenance(model: unknown): ResponseProvenance {
+  const requestedModel = typeof model === "string" ? model.trim() : "";
+  const separator = requestedModel.indexOf("/");
+  const requestedProvider = separator > 0 ? requestedModel.slice(0, separator) : undefined;
+  return {
+    requested_provider: requestedProvider,
+    requested_model: requestedModel || undefined,
+    fallback_used: false,
+  };
 }
 
 const comboPromoteDeps = { updateCombo, info: log.info, warn: log.warn };
@@ -431,6 +456,8 @@ export async function handleChat(
   // resolveRoutingModel). The resolved model still passes through
   // enforceApiKeyPolicy below, so it cannot bypass per-key allowlists.
   let modelStr = resolveRoutingModel(request, body);
+  const clientRequestedModelStr = modelStr;
+  const requestedResponseProvenance = buildRequestedResponseProvenance(clientRequestedModelStr);
 
   // cc discovery alias (`claude/<provider>/<model>`, `claude/combo/<name>`):
   // resolve back to the real id before any combo lookup / resolveModelOrError()
@@ -812,6 +839,7 @@ export async function handleChat(
 
     // Context-relay keeps generation in combo.ts, but handoff injection lives here
     // because only this layer knows which connectionId was actually selected.
+    let comboDispatchCount = 0;
     const response = await (handleComboChat as any)({
       body,
       combo,
@@ -828,9 +856,12 @@ export async function handleChat(
           providerId?: string | null;
           effectiveComboStrategy?: string | null;
           modelAbortSignal?: AbortSignal | null;
+          routingFallbackUsed?: boolean;
         }
-      ) =>
-        handleSingleModelChat(
+      ) => {
+        const fallbackUsed = target?.routingFallbackUsed === true || comboDispatchCount > 0;
+        comboDispatchCount += 1;
+        return handleSingleModelChat(
           b,
           m,
           clientRawRequest,
@@ -858,6 +889,10 @@ export async function handleChat(
             reasoningDecision,
             reasoningIntent,
             reasoningRequestTags: requestRoutingTags.tags,
+            responseProvenance: {
+              ...requestedResponseProvenance,
+              fallback_used: fallbackUsed,
+            },
             // #7360 follow-up: without this, a target dispatch abandoned by
             // targetTimeoutRunner.ts's per-target timeout (comboTargetTimeoutMs)
             // never learns it was abandoned — it only watches the ORIGINAL
@@ -881,7 +916,8 @@ export async function handleChat(
               comboPromoteDeps
             );
           return res;
-        }),
+        });
+      },
       isModelAvailable: checkModelAvailable,
       log,
       settings,
@@ -919,6 +955,10 @@ export async function handleChat(
             sessionAffinityKey,
             emergencyFallbackTried: true,
             forceLiveComboTest: isComboLiveTest,
+            responseProvenance: {
+              ...requestedResponseProvenance,
+              fallback_used: true,
+            },
           },
           combo.strategy,
           true
@@ -1000,6 +1040,7 @@ export async function handleChat(
       reasoningDecision,
       reasoningIntent,
       reasoningRequestTags: requestRoutingTags.tags,
+      responseProvenance: requestedResponseProvenance,
     },
     null,
     false
@@ -1048,6 +1089,7 @@ async function handleSingleModelChat(
     reasoningDecision?: ReasoningRuleDecision | null;
     reasoningIntent?: ExtractedReasoningIntent | null;
     reasoningRequestTags?: string[];
+    responseProvenance?: ResponseProvenance | null;
     /**
      * Per-target abort signal from combo.ts's targetTimeoutRunner
      * (comboTargetTimeoutMs) — see the #7360 follow-up comment at the
@@ -1079,6 +1121,7 @@ async function handleSingleModelChat(
     );
     log.info("ROUTING", `Auto-combo redirect from handleSingleModelChat for "${modelStr}"`);
     log.info("ROUTING", `Auto-combo redirect to combo flow for "${modelStr}"`);
+    let redirectDispatchCount = 0;
     return handleComboChat({
       body,
       combo: redirectCombo,
@@ -1094,9 +1137,12 @@ async function handleSingleModelChat(
           providerId?: string | null;
           effectiveComboStrategy?: string | null;
           modelAbortSignal?: AbortSignal | null;
+          routingFallbackUsed?: boolean;
         }
-      ) =>
-        handleSingleModelChat(
+      ) => {
+        const fallbackUsed = target?.routingFallbackUsed === true || redirectDispatchCount > 0;
+        redirectDispatchCount += 1;
+        return handleSingleModelChat(
           b,
           m,
           clientRawRequest,
@@ -1115,12 +1161,17 @@ async function handleSingleModelChat(
             allowRateLimitedConnection: target?.allowRateLimitedConnection === true,
             providerId: target?.providerId ?? null,
             correlationId: runtimeOptions?.correlationId ?? null,
+            responseProvenance: {
+              ...(runtimeOptions.responseProvenance ?? { requested_model: modelStr }),
+              fallback_used: fallbackUsed,
+            },
             // #7360 follow-up — see the primary handleSingleModel closure above.
             modelAbortSignal: target?.modelAbortSignal ?? null,
           },
           target?.effectiveComboStrategy ?? redirectCombo.strategy ?? "priority",
           false
-        ),
+        );
+      },
       isModelAvailable: async () => true,
       log,
       settings: {},
@@ -1473,6 +1524,10 @@ async function handleSingleModelChat(
         clientRawRequest,
         runtimeOptions.modelAbortSignal
       );
+      const responseFallbackUsed =
+        runtimeOptions.responseProvenance?.fallback_used === true ||
+        excludedConnectionIds.size > 0 ||
+        degradedFallbackResponse !== null;
       const { result, tlsFingerprintUsed } = await executeChatWithBreaker({
         bypassCircuitBreaker: forceLiveComboTest || hasForcedConnection,
         breaker,
@@ -1500,6 +1555,13 @@ async function handleSingleModelChat(
         correlationId: runtimeOptions?.correlationId ?? null,
         modelPinned: runtimeOptions?.modelPinned ?? false,
         routingComboId: runtimeOptions?.routingComboId ?? null,
+        responseProvenance: {
+          ...(runtimeOptions.responseProvenance ?? {}),
+          fallback_used: responseFallbackUsed,
+          ...(responseFallbackUsed
+            ? { fallback_provider: provider, fallback_model: effectiveModel }
+            : {}),
+        },
       });
       if (telemetry) telemetry.endPhase();
 
@@ -1765,6 +1827,10 @@ async function handleSingleModelChat(
                 forcedConnectionId: null,
                 comboStepId: null,
                 comboExecutionKey: null,
+                responseProvenance: {
+                  ...(runtimeOptions.responseProvenance ?? {}),
+                  fallback_used: true,
+                },
               },
               null, // no strategy for emergency fallback
               Boolean(comboName) // isCombo if comboName exists

@@ -51,7 +51,7 @@ test("Gemini non-stream: single candidate text maps to one OpenAI choice", () =>
   });
 });
 
-test("Gemini non-stream: multiple candidates keep multimodal content, reasoning and tool calls", () => {
+test("Gemini non-stream: multiple candidates keep text, images, reasoning and tool calls", () => {
   const result = translateNonStreamingResponse(
     {
       responseId: "resp-multi",
@@ -93,9 +93,9 @@ test("Gemini non-stream: multiple candidates keep multimodal content, reasoning 
   assert.equal((result as any).choices.length, 2);
   assert.equal(((result as any).choices as any)[0].finish_reason, "tool_calls");
   assert.equal(((result as any).choices[0] as any).message.reasoning_content, "Plan first.");
-  assert.equal((result as any).choices[0].message.content[0].text, "Answer:");
+  assert.equal((result as any).choices[0].message.content, "Answer:");
   assert.equal(
-    ((result as any).choices[0].message as any).content[1].image_url.url,
+    ((result as any).choices[0].message as any).images[0].image_url.url,
     "data:image/png;base64,abc123"
   );
   assert.equal((result as any).choices[0].message.tool_calls[0].function.name, "read_file");
@@ -1174,7 +1174,10 @@ test("Gemini stream: open textual reasoning is flushed before a signed native to
     "buffered textual reasoning must be flushed, not dropped, when a tool call arrives"
   );
   assert.equal(r2[toolIdx]?.choices[0].delta.tool_calls[0].id, "call-flush-1");
-  assert.ok(reasoningIdx >= 0 && toolIdx > reasoningIdx, "reasoning is emitted before the tool call");
+  assert.ok(
+    reasoningIdx >= 0 && toolIdx > reasoningIdx,
+    "reasoning is emitted before the tool call"
+  );
 });
 
 // #3821-review LEDGER-15 — a reasoning-only chunk interrupting a partially-buffered

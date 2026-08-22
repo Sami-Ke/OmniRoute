@@ -58,6 +58,8 @@ export type SingleModelTarget =
       modelAbortSignal?: AbortSignal | null;
       /** True when this target was selected via context-cache session pinning. */
       modelPinned?: boolean;
+      /** True when this dispatch is an alternate target rather than the first route. */
+      routingFallbackUsed?: boolean;
     })
   | { modelAbortSignal: AbortSignal };
 
@@ -169,6 +171,8 @@ export type ResolvedComboTarget = {
   label: string | null;
   failoverBeforeRetry?: unknown;
   trafficType?: "production" | "shadow";
+  /** Set by the priority/failover loop when an earlier target was bypassed or failed. */
+  routingFallbackUsed?: boolean;
   /**
    * Fingerprint-based account pin resolved from a combo builder composite
    * connectionId (`${rowId}|fp|${fingerprint}`, see

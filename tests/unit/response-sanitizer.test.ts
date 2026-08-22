@@ -474,6 +474,46 @@ test("sanitizeStreamingChunk keeps only safe chunk fields and preserves readable
   });
 });
 
+test("sanitizeStreamingChunk preserves safe OmniRoute citation and provenance metadata", () => {
+  const sanitized = sanitizeStreamingChunk({
+    id: "chunk_meta",
+    choices: [{ delta: { annotations: [] } }],
+    omniroute: {
+      citations: {
+        status: "found",
+        sources_detected: 1,
+        invalid_candidates: 0,
+        unknown_shapes: ["$.delta.citation"],
+      },
+      provenance: {
+        requested_provider: "combo",
+        requested_model: "combo/geo",
+        upstream_provider: "claude-web",
+        upstream_model: "claude-opus-5",
+        fallback_used: false,
+        secret: "drop-me",
+      },
+      internal_debug: "drop-me",
+    },
+  }) as Record<string, unknown>;
+
+  assert.deepEqual(sanitized.omniroute, {
+    citations: {
+      status: "found",
+      sources_detected: 1,
+      invalid_candidates: 0,
+      unknown_shapes: ["$.delta.citation"],
+    },
+    provenance: {
+      requested_provider: "combo",
+      requested_model: "combo/geo",
+      upstream_provider: "claude-web",
+      upstream_model: "claude-opus-5",
+      fallback_used: false,
+    },
+  });
+});
+
 test("sanitizeStreamingChunk converts reasoning_details arrays in deltas", () => {
   const sanitized = sanitizeStreamingChunk({
     choices: [

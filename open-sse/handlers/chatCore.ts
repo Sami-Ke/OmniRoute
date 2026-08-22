@@ -79,6 +79,11 @@ import { defaultClaudeToolType } from "./chatCore/claudeToolDefaults.ts";
 import { injectSystemPrompt, injectCustomSystemPrompt } from "../services/systemPrompt.ts";
 import { translateRequest, needsTranslation } from "../translator/index.ts";
 import { FORMATS } from "../translator/formats.ts";
+import {
+  attachResponseProvenance,
+  normalizeOpenAICompatibleResponse,
+  type ResponseProvenance,
+} from "../translator/citationNormalizer.ts";
 import { collectCustomToolNamesForSourceFormat } from "../translator/request/openai-responses/additionalTools.ts";
 import { sanitizeKiroTools } from "../utils/kiroSanitizer.ts";
 import { splitMisplacedToolResults } from "../translator/helpers/claudeHelper.ts";
@@ -420,6 +425,7 @@ export async function handleChatCore({
   createPiiTransform = null,
   correlationId = null,
   modelPinned = false,
+  routingProvenance = null,
 }) {
   let { provider, model, extendedContext } = modelInfo;
   // ── Memory pressure guard ────────────────────────────────────────────
@@ -3192,6 +3198,18 @@ export async function handleChatCore({
   // T5: track which models we've tried for intra-family fallback
   const triedModels = new Set<string>([effectiveModel]);
   let currentModel = effectiveModel;
+  const buildResponseProvenance = (): ResponseProvenance => {
+    const fallbackUsed = routingProvenance?.fallback_used === true || triedModels.size > 1;
+    return {
+      requested_provider: routingProvenance?.requested_provider ?? provider,
+      requested_model: routingProvenance?.requested_model ?? requestedModel ?? model,
+      upstream_provider: provider,
+      upstream_model: currentModel,
+      fallback_used: fallbackUsed,
+      fallback_provider: fallbackUsed ? provider : undefined,
+      fallback_model: fallbackUsed ? currentModel : undefined,
+    };
+  };
 
   // Log start
   appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => {});
@@ -4316,6 +4334,19 @@ export async function handleChatCore({
           responseToolNameMap
         )
       : responseBody;
+
+    // Citation/content normalization belongs at the provider translation boundary.
+    // Keep the native response available as a citation source so a provider's
+    // annotations are not lost when its OpenAI-compatible projection is sparse.
+    if (
+      clientResponseFormat === FORMATS.OPENAI ||
+      clientResponseFormat === FORMATS.OPENAI_RESPONSES
+    ) {
+      translatedResponse = normalizeOpenAICompatibleResponse(translatedResponse, {
+        citationSources: [responseBody],
+      });
+      translatedResponse = attachResponseProvenance(translatedResponse, buildResponseProvenance());
+    }
     const memoryExtractionResponse = translatedResponse;
 
     // T26: Strip markdown code blocks if provider format is Claude
@@ -4614,6 +4645,9 @@ export async function handleChatCore({
       requestId: skillRequestId,
       compressionResponseMeta,
       comboStrategy,
+      fallbackAttempts: buildResponseProvenance().fallback_used
+        ? Math.max(1, triedModels.size - 1)
+        : 0,
     });
     // #6426: align response body `model` with the `X-OmniRoute-Model` header
     // (both must be the resolved backend model). Some upstreams (notably legacy
@@ -4725,6 +4759,9 @@ export async function handleChatCore({
     pendingRequestId,
     compressionResponseMeta,
     comboStrategy,
+    fallbackAttempts: buildResponseProvenance().fallback_used
+      ? Math.max(1, triedModels.size - 1)
+      : 0,
   });
 
   // Create transform stream with logger for streaming response
@@ -4757,6 +4794,15 @@ export async function handleChatCore({
     }
     const cacheUsageLogMeta = buildCacheUsageLogMeta(streamUsage);
     const streamConnectionId = getCurrentConnectionId();
+    const clientStreamResponseBody =
+      normalizedStreamStatus === 200 && streamResponseBody
+        ? attachResponseProvenance(
+            normalizeOpenAICompatibleResponse(streamResponseBody, {
+              citationSources: providerPayload ? [providerPayload] : [],
+            }),
+            buildResponseProvenance()
+          )
+        : streamResponseBody;
 
     if (normalizedStreamStatus === 200) {
       void maybeSyncClaudeExtraUsageState({
@@ -4769,9 +4815,9 @@ export async function handleChatCore({
 
     // Reasoning Replay Cache (#1628): Capture reasoning_content from streaming responses
     // with tool_calls so it can be replayed on subsequent turns (DeepSeek V4, Kimi K2, etc.)
-    if (normalizedStreamStatus === 200 && streamResponseBody) {
+    if (normalizedStreamStatus === 200 && clientStreamResponseBody) {
       try {
-        const body = streamResponseBody as Record<string, unknown>;
+        const body = clientStreamResponseBody as Record<string, unknown>;
         const choices = body.choices as { message?: Record<string, unknown> }[] | undefined;
         const msg = choices?.[0]?.message;
         cacheReasoningFromAssistantMessage(msg, provider, model, {
@@ -4782,7 +4828,8 @@ export async function handleChatCore({
         // Cache capture is non-critical — never block the stream
       }
     }
-    effectiveServiceTier = resolveReportedServiceTier(streamResponseBody) ?? effectiveServiceTier;
+    effectiveServiceTier =
+      resolveReportedServiceTier(clientStreamResponseBody) ?? effectiveServiceTier;
 
     // Context Editing telemetry (streaming): the reconstructed stream body now carries
     // context_management.applied_edits from the final message_delta snapshot. Mirror the
@@ -4792,7 +4839,7 @@ export async function handleChatCore({
       recordContextEditingTelemetryHook({
         contextEditingEnabled,
         provider,
-        responseBody: streamResponseBody,
+        responseBody: clientStreamResponseBody,
         skillRequestId,
         log,
       });
@@ -4803,8 +4850,8 @@ export async function handleChatCore({
       model,
       provider,
       connectionId: streamConnectionId,
-      providerResponse: providerPayload ?? streamResponseBody ?? undefined,
-      clientResponse: clientPayload ?? streamResponseBody ?? undefined,
+      providerResponse: providerPayload ?? clientStreamResponseBody ?? undefined,
+      clientResponse: clientPayload ?? clientStreamResponseBody ?? undefined,
       status: normalizedStreamStatus,
       error: streamError,
       errorCode: streamErrorCode,
@@ -4841,10 +4888,10 @@ export async function handleChatCore({
       status: normalizedStreamStatus,
       error: streamError || undefined,
       tokens: streamUsage || {},
-      responseBody: streamResponseBody ?? undefined,
+      responseBody: clientStreamResponseBody ?? undefined,
       providerRequest: finalBody || translatedBody,
       providerResponse: providerPayload,
-      clientResponse: clientPayload ?? streamResponseBody ?? undefined,
+      clientResponse: clientPayload ?? clientStreamResponseBody ?? undefined,
       claudeCacheMeta: claudePromptCacheLogMeta,
       claudeCacheUsageMeta: cacheUsageLogMeta,
       cacheSource: "upstream",
@@ -4889,7 +4936,7 @@ export async function handleChatCore({
       }
 
       const streamedMemoryText = extractMemoryTextFromResponse(
-        (streamResponseBody ?? null) as Record<string, unknown> | null
+        (clientStreamResponseBody ?? null) as Record<string, unknown> | null
       );
       if (streamedMemoryText) {
         extractFacts(streamedMemoryText, memoryOwnerId, pipelineSessionId);
@@ -4900,7 +4947,7 @@ export async function handleChatCore({
     storeStreamingSemanticCacheResponse({
       enabled: semanticCacheEnabled,
       streamStatus,
-      streamResponseBody,
+      streamResponseBody: clientStreamResponseBody,
       body,
       headers: clientRawRequest?.headers,
       model,
@@ -4955,7 +5002,10 @@ export async function handleChatCore({
       // openai-responses → openai translation still wants the namespace identity
       // map for #7936-style round-trip closure when the client also speaks
       // Responses (Codex CLI).
-      requestToolIdentityMap
+      false,
+      customToolNames,
+      requestToolIdentityMap,
+      buildResponseProvenance()
     );
   } else if (needsTranslation(targetFormat, clientResponseFormat)) {
     // Standard translation for other providers
@@ -4985,7 +5035,8 @@ export async function handleChatCore({
         clientResponseFormat,
       }),
       customToolNames,
-      requestToolIdentityMap
+      requestToolIdentityMap,
+      buildResponseProvenance()
     );
   } else {
     log?.debug?.("STREAM", `Standard passthrough mode`);
@@ -5000,7 +5051,8 @@ export async function handleChatCore({
       apiKeyInfo,
       handleStreamFailure,
       clientResponseFormat,
-      requestToolIdentityMap
+      requestToolIdentityMap,
+      buildResponseProvenance()
     );
   }
 

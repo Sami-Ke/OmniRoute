@@ -923,8 +923,13 @@ export async function handleComboChat({
               ...target,
               allowRateLimitedConnection: true,
               modelAbortSignal: abortControllers.get(i)!.signal,
+              routingFallbackUsed: i > 0,
             }
-          : { ...target, modelAbortSignal: abortControllers.get(i)!.signal };
+          : {
+              ...target,
+              modelAbortSignal: abortControllers.get(i)!.signal,
+              routingFallbackUsed: i > 0,
+            };
 
         // #1731 / #1731v2: skip targets already known-exhausted this request (shared predicate).
         const exhaustedSkip = getExhaustedTargetSkipReason(

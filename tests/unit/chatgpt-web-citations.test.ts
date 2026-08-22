@@ -309,6 +309,48 @@ test("Streaming: buffers split ChatGPT citation markers until metadata can link 
       "Tesla FSD v14 is rolling out [1](https://www.tesla.com/fsd)[2](https://example.com/owners)."
     );
     assert.doesNotMatch(content, /|||turn0search/);
+    const chunks = text
+      .split("\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => {
+        try {
+          return JSON.parse(line.slice(6));
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    type CitationChunk = {
+      choices: Array<{
+        delta?: {
+          annotations?: Array<{ url_citation: { url: string } }>;
+        };
+      }>;
+      omniroute: {
+        citations: { status: string };
+        provenance: Record<string, unknown>;
+      };
+    };
+    const annotationChunk = chunks.find((chunk: unknown): chunk is CitationChunk => {
+      if (!chunk || typeof chunk !== "object") return false;
+      const record = chunk as { choices?: unknown };
+      if (!Array.isArray(record.choices)) return false;
+      const firstChoice = record.choices[0] as { delta?: { annotations?: unknown } } | undefined;
+      return Array.isArray(firstChoice?.delta?.annotations);
+    });
+    assert.ok(annotationChunk);
+    assert.deepEqual(
+      annotationChunk.choices[0].delta.annotations.map(
+        (item: { url_citation: { url: string } }) => item.url_citation.url
+      ),
+      ["https://www.tesla.com/fsd", "https://example.com/owners"]
+    );
+    assert.equal(annotationChunk.omniroute.citations.status, "found");
+    assert.deepEqual(annotationChunk.omniroute.provenance, {
+      upstream_provider: "chatgpt-web",
+      upstream_model: "gpt-5.5-pro-extended",
+      fallback_used: false,
+    });
   } finally {
     m.restore();
   }

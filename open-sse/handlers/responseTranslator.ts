@@ -6,6 +6,7 @@ import {
 import { normalizeOpenAICompatibleFinishReasonString } from "../utils/finishReason.ts";
 import { containsTextualToolCallMarker } from "../utils/textualToolCall.ts";
 import { getAnyReasoningValue } from "../utils/reasoningFields.ts";
+import { normalizeOpenAICompatibleResponse } from "../translator/citationNormalizer.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -137,7 +138,9 @@ export function translateNonStreamingResponse(
 ): unknown {
   // If already in source format, return as-is
   if (targetFormat === sourceFormat) {
-    return responseBody;
+    return targetFormat === FORMATS.OPENAI
+      ? normalizeOpenAICompatibleResponse(responseBody)
+      : responseBody;
   }
 
   let intermediateOpenAI = responseBody;
@@ -296,7 +299,9 @@ export function translateNonStreamingResponse(
       }
     }
 
-    intermediateOpenAI = result;
+    intermediateOpenAI = normalizeOpenAICompatibleResponse(result, {
+      citationSources: [responseBody],
+    });
   }
 
   // Handle Gemini/Antigravity format
@@ -404,13 +409,9 @@ export function translateNonStreamingResponse(
               }
 
               const message: JsonRecord = { role: "assistant" };
-              if (contentParts.length === 1 && contentParts[0].type === "text") {
-                message.content = contentParts[0].text;
-              } else if (contentParts.length > 0) {
-                message.content = contentParts;
-              } else if (textContent) {
-                message.content = textContent;
-              }
+              message.content = textContent;
+              const imageParts = contentParts.filter((part) => part.type === "image_url");
+              if (imageParts.length > 0) message.images = imageParts;
               if (reasoningContent) {
                 message.reasoning_content = reasoningContent;
               }
@@ -472,7 +473,9 @@ export function translateNonStreamingResponse(
         }
       }
 
-      intermediateOpenAI = result;
+      intermediateOpenAI = normalizeOpenAICompatibleResponse(result, {
+        citationSources: [responseBody],
+      });
     }
   }
 
@@ -561,7 +564,9 @@ export function translateNonStreamingResponse(
         result.usage = usageOut;
       }
 
-      intermediateOpenAI = result;
+      intermediateOpenAI = normalizeOpenAICompatibleResponse(result, {
+        citationSources: [responseBody],
+      });
     }
   }
 
@@ -585,6 +590,11 @@ export function translateNonStreamingResponse(
   }
 
   // Return intermediateOpenAI (which is either the raw response if unknown targetFormat, or an OpenAI compatible payload)
+  if (sourceFormat === FORMATS.OPENAI && toRecord(intermediateOpenAI).choices) {
+    intermediateOpenAI = normalizeOpenAICompatibleResponse(intermediateOpenAI, {
+      citationSources: [responseBody],
+    });
+  }
   return intermediateOpenAI;
 }
 

@@ -412,15 +412,27 @@ export function renderChatGptTextWithAnnotations(
   const sourceByCanonicalUrl = new Map(
     citationData.sources.map((source) => [canonicalCitationUrl(source.url), source])
   );
-  const annotations = extractUrlCitationsFromContent(content).map((annotation) => {
-    const source = sourceByCanonicalUrl.get(canonicalCitationUrl(annotation.url_citation.url));
-    return source
-      ? {
-          ...annotation,
-          url_citation: { ...annotation.url_citation, title: source.title },
-        }
-      : annotation;
-  });
+  const explicitCitationUrls = new Set(sourceByCanonicalUrl.keys());
+  for (const mention of citationData.mentions) {
+    for (const annotation of extractUrlCitationsFromContent(mention.replacement)) {
+      explicitCitationUrls.add(canonicalCitationUrl(annotation.url_citation.url));
+    }
+  }
+  // Only expose URLs that came from ChatGPT's explicit content-reference
+  // metadata. A URL merely appearing in answer prose is not a verified source.
+  const annotations = extractUrlCitationsFromContent(content)
+    .filter((annotation) =>
+      explicitCitationUrls.has(canonicalCitationUrl(annotation.url_citation.url))
+    )
+    .map((annotation) => {
+      const source = sourceByCanonicalUrl.get(canonicalCitationUrl(annotation.url_citation.url));
+      return source
+        ? {
+            ...annotation,
+            url_citation: { ...annotation.url_citation, title: source.title },
+          }
+        : annotation;
+    });
   const seen = new Set(
     annotations.map((annotation) => canonicalCitationUrl(annotation.url_citation.url))
   );

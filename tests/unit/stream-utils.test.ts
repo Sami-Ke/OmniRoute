@@ -219,6 +219,75 @@ test("createSSEStream passthrough normalizes tool-call finishes and reports the 
   assert.equal(onCompletePayload.clientPayload._streamed, true);
 });
 
+test("createSSEStream keeps citation annotations in streamed chunks and completion payload", async () => {
+  let onCompletePayload = null;
+  const responseProvenance = {
+    requested_provider: "gw",
+    requested_model: "gw/fast",
+    upstream_provider: "grok-web",
+    upstream_model: "fast",
+    fallback_used: false,
+  };
+  const text = await readTransformed(
+    [
+      `data: ${JSON.stringify({
+        id: "chatcmpl_citation_stream",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4.1-mini",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              content: "Answer",
+              citations: [{ url: "https://example.test/source", title: "Source" }],
+            },
+          },
+        ],
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        id: "chatcmpl_citation_stream",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4.1-mini",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`,
+    ],
+    {
+      mode: "passthrough",
+      sourceFormat: FORMATS.OPENAI,
+      clientResponseFormat: FORMATS.OPENAI,
+      provider: "openai",
+      model: "gpt-4.1-mini",
+      body: { messages: [{ role: "user", content: "find sources" }] },
+      responseProvenance,
+      onComplete(payload) {
+        onCompletePayload = payload;
+      },
+    }
+  );
+
+  const streamed = parseJsonDataPayloads(text);
+  assert.deepEqual(streamed[0].choices[0].delta.annotations, [
+    {
+      type: "url_citation",
+      url_citation: { url: "https://example.test/source", title: "Source" },
+    },
+  ]);
+  assert.deepEqual(onCompletePayload.responseBody.choices[0].message.annotations, [
+    {
+      type: "url_citation",
+      url_citation: { url: "https://example.test/source", title: "Source" },
+    },
+  ]);
+  assert.equal(onCompletePayload.responseBody.omniroute.citations.status, "found");
+  const terminal = streamed.find((chunk) => chunk.choices?.[0]?.finish_reason);
+  assert.deepEqual(terminal.omniroute.provenance, responseProvenance);
+  assert.equal(terminal.omniroute.citations.status, "found");
+  assert.deepEqual(onCompletePayload.responseBody.omniroute.provenance, responseProvenance);
+});
+
 test("createSSEStream passthrough converts textual tool-call content into structured call log tool_calls", async () => {
   let onCompletePayload = null;
   const toolArgs = JSON.stringify({
@@ -263,7 +332,7 @@ test("createSSEStream passthrough converts textual tool-call content into struct
   assert.doesNotMatch(text, /"content":"\[Tool call: terminal/);
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "tool_calls");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls[0].function.name, "terminal");
   assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
     command: 'sqlite3 /root/.omniroute/omniroute.db ".tables"',
@@ -319,7 +388,7 @@ test("createSSEStream passthrough converts split textual tool-call content at co
   assert.doesNotMatch(text, /"content":"\[Tool call: terminal/);
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "tool_calls");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls[0].function.name, "terminal");
   assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
     command: 'sqlite3 ~/.omniroute/omniroute.db ".tables"',
@@ -383,7 +452,7 @@ test("createSSEStream passthrough handles textual tool-call content split inside
   assert.match(text, /"name":"terminal"/);
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "tool_calls");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls[0].function.name, "terminal");
   assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
     command: "whoami",
@@ -444,7 +513,7 @@ test("createSSEStream passthrough buffers fragmented textual tool-call JSON befo
   assert.match(text, /"finish_reason":"tool_calls"/);
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "tool_calls");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls[0].function.name, "terminal");
   assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
     command: "echo live_shape",
@@ -492,7 +561,7 @@ test("createSSEStream passthrough suppresses trailing prose plus textual tool ca
   assert.equal(onCompletePayload.status, 200);
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "tool_calls");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls[0].function.name, "terminal");
   assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
     command: "echo should_not_leak",
@@ -545,7 +614,7 @@ Arguments: {"path":"/opt/OmniRoute/src","target":"files"}`;
 
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "stop");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls, undefined);
   assert.doesNotMatch(text, /search_files_ide/);
   assert.doesNotMatch(JSON.stringify(onCompletePayload.responseBody), /search_files_ide/);
@@ -586,7 +655,7 @@ test("createSSEStream passthrough suppresses malformed textual tool-call content
 
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "stop");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls, undefined);
   // PR #3355 bug-2 fix: flush now always emits the buffer as plain text (not swallowed).
   assert.match(text, /\[Tool call: terminal\]/);
@@ -627,7 +696,7 @@ test("createSSEStream suppresses malformed compact textual tool-call content", a
 
   const choice = onCompletePayload.responseBody.choices[0];
   assert.equal(choice.finish_reason, "stop");
-  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.content, "");
   assert.equal(choice.message.tool_calls, undefined);
   assert.doesNotMatch(JSON.stringify(onCompletePayload.responseBody), /\[Tool call:/);
 });
@@ -1049,7 +1118,7 @@ Arguments: {"command":"systemctl status omniroute"}`;
   assert.match(text, /response.function_call_arguments.done/);
   assert.match(text, /"name":"terminal"/);
   assert.equal(onCompletePayload.responseBody.choices[0].finish_reason, "tool_calls");
-  assert.equal(onCompletePayload.responseBody.choices[0].message.content, null);
+  assert.equal(onCompletePayload.responseBody.choices[0].message.content, "");
   assert.equal(
     onCompletePayload.responseBody.choices[0].message.tool_calls[0].function.name,
     "terminal"
@@ -2351,8 +2420,8 @@ test("createSSEStream passthrough logs empty response after tool_calls completio
     onCompletePayload.responseBody.choices[0].message.tool_calls[0].function.name,
     "task_complete"
   );
-  // Content should be null (empty) since no text was generated
-  assert.equal(onCompletePayload.responseBody.choices[0].message.content, null);
+  // Content should be an empty string since no text was generated.
+  assert.equal(onCompletePayload.responseBody.choices[0].message.content, "");
 });
 
 test("createSSEStream passthrough does not swallow false positive textual tool call", async () => {

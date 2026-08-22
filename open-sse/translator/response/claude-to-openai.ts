@@ -1,5 +1,6 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
+import { normalizeCitationCandidates } from "../citationNormalizer.ts";
 
 type OpenAIUsage = {
   prompt_tokens: number;
@@ -28,6 +29,12 @@ function createChunk(state, delta, finishReason = null) {
   };
 }
 
+function withCitationAnnotations(delta, value) {
+  if (value === undefined) return delta;
+  const annotations = normalizeCitationCandidates(value, "$.claude.citations").annotations;
+  return annotations.length > 0 ? { ...delta, annotations } : delta;
+}
+
 // Convert Claude stream chunk to OpenAI format
 export function claudeToOpenAIResponse(chunk, state) {
   if (!chunk) return null;
@@ -40,7 +47,9 @@ export function claudeToOpenAIResponse(chunk, state) {
       state.messageId = chunk.message?.id || `msg_${Date.now()}`;
       state.model = chunk.message?.model;
       state.toolCallIndex = 0;
-      results.push(createChunk(state, { role: "assistant" }));
+      results.push(
+        createChunk(state, withCitationAnnotations({ role: "assistant" }, chunk.message?.citations))
+      );
       break;
     }
 
@@ -48,6 +57,8 @@ export function claudeToOpenAIResponse(chunk, state) {
       const block = chunk.content_block;
       if (block?.type === "text") {
         state.textBlockStarted = true;
+        const citationChunk = withCitationAnnotations({}, block.citations);
+        if (citationChunk.annotations) results.push(createChunk(state, citationChunk));
       } else if (block?.type === "thinking") {
         state.inThinkingBlock = true;
         state.currentBlockIndex = chunk.index;
@@ -75,6 +86,11 @@ export function claudeToOpenAIResponse(chunk, state) {
 
     case "content_block_delta": {
       const delta = chunk.delta;
+      const citationValue = delta?.citations ?? delta?.citation ?? delta?.annotations;
+      const citationAnnotations =
+        citationValue === undefined
+          ? []
+          : normalizeCitationCandidates(citationValue, "$.claude.delta.citations").annotations;
       if (delta?.type === "text_delta" && delta.text) {
         // Flush the deferred </think> close marker before the first text delta so
         // clients like Claude Code / Cursor (that scan content for </think>) see it
@@ -88,7 +104,14 @@ export function claudeToOpenAIResponse(chunk, state) {
           }
           state.pendingThinkClose = false;
         }
-        results.push(createChunk(state, { content: delta.text }));
+        results.push(
+          createChunk(
+            state,
+            citationAnnotations.length > 0
+              ? { content: delta.text, annotations: citationAnnotations }
+              : { content: delta.text }
+          )
+        );
       } else if (delta?.type === "thinking_delta" && delta.thinking) {
         // Map Claude thinking_delta → OpenAI reasoning_content
         // Clients (Claude Code, Cursor, etc.) display reasoning_content as the thinking panel
@@ -264,6 +287,11 @@ export function claudeToOpenAIResponse(chunk, state) {
           }
         }
 
+        const finalCitationChunk = withCitationAnnotations(
+          finalChunk.choices[0].delta,
+          chunk.delta?.citations ?? chunk.delta?.annotations
+        );
+        finalChunk.choices[0].delta = finalCitationChunk;
         results.push(finalChunk);
         state.finishReasonSent = true;
       }

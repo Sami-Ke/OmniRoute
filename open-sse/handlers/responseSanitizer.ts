@@ -62,6 +62,68 @@ function toNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+const OMNIROUTE_PROVENANCE_FIELDS = [
+  "requested_provider",
+  "requested_model",
+  "upstream_provider",
+  "upstream_model",
+  "fallback_provider",
+  "fallback_model",
+] as const;
+
+function safeOmniRouteString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  return normalized ? normalized.slice(0, 256) : undefined;
+}
+
+function sanitizeOmniRouteMetadata(value: unknown): JsonRecord | null {
+  const source = toRecord(value);
+  if (!source) return null;
+  const sanitized: JsonRecord = {};
+
+  const citations = toRecord(source.citations);
+  if (citations) {
+    const safeCitations: JsonRecord = {};
+    const status = safeOmniRouteString(citations.status);
+    if (status && ["found", "none", "unsupported_shape", "invalid"].includes(status)) {
+      safeCitations.status = status;
+    }
+    for (const field of ["sources_detected", "invalid_candidates"] as const) {
+      const number = toNumber(citations[field]);
+      if (number !== undefined && number >= 0) safeCitations[field] = number;
+    }
+    if (Array.isArray(citations.unknown_shapes)) {
+      safeCitations.unknown_shapes = citations.unknown_shapes
+        .filter((item): item is string => typeof item === "string")
+        .slice(0, 32)
+        .map((item) => item.slice(0, 256));
+    }
+    if (Object.keys(safeCitations).length > 0) sanitized.citations = safeCitations;
+  }
+
+  const provenance = toRecord(source.provenance);
+  if (provenance) {
+    const safeProvenance: JsonRecord = {};
+    for (const field of OMNIROUTE_PROVENANCE_FIELDS) {
+      const string = safeOmniRouteString(provenance[field]);
+      if (string) safeProvenance[field] = string;
+    }
+    if (typeof provenance.fallback_used === "boolean") {
+      safeProvenance.fallback_used = provenance.fallback_used;
+    }
+    if (Object.keys(safeProvenance).length > 0) sanitized.provenance = safeProvenance;
+  }
+
+  for (const field of ["quality"] as const) {
+    const string = safeOmniRouteString(source[field]);
+    if (string) sanitized[field] = string;
+  }
+  if (typeof source.fallback_used === "boolean") sanitized.fallback_used = source.fallback_used;
+
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+}
+
 function deleteOpenAICompatibleReasoningFields(record: JsonRecord): void {
   delete record.reasoning_content;
   delete record.reasoning;
@@ -363,6 +425,9 @@ export function sanitizeResponsesApiResponse(body: unknown): unknown {
     sanitized.usage = sanitizeResponsesUsage(responseRoot.usage);
   }
 
+  const omniroute = toRecord(responseRoot.omniroute) ?? toRecord(bodyRecord.omniroute);
+  if (omniroute) sanitized.omniroute = { ...omniroute };
+
   return sanitized;
 }
 
@@ -461,6 +526,10 @@ function sanitizeMessage(msg: unknown, options: ParseOptions = {}): unknown {
 
   if (msgRecord.function_call) {
     sanitized.function_call = stripZeroWidthFunctionArguments(msgRecord.function_call);
+  }
+
+  if (Array.isArray(msgRecord.images)) {
+    sanitized.images = msgRecord.images;
   }
 
   // `annotations` is part of OpenAI's assistant-message citation shape. Web
@@ -853,7 +922,10 @@ function sanitizeResponsesOutputItem(item: unknown, index: number): JsonRecord |
   return { ...itemRecord, type };
 }
 
-function sanitizeResponsesMessageContent(content: unknown): JsonRecord[] {
+function sanitizeResponsesMessageContent(
+  content: unknown,
+  fallbackAnnotations: unknown[] = []
+): JsonRecord[] {
   if (typeof content === "string") {
     if (content.length === 0) return [];
     return [
@@ -862,7 +934,7 @@ function sanitizeResponsesMessageContent(content: unknown): JsonRecord[] {
         text: collapseExcessiveNewlines(
           stripInternalReasoningPlaceholder(stripInternalToolEnvelopeText(content))
         ),
-        annotations: [],
+        annotations: fallbackAnnotations,
       },
     ];
   }
@@ -879,7 +951,7 @@ function sanitizeResponsesMessageContent(content: unknown): JsonRecord[] {
             text: collapseExcessiveNewlines(
               stripInternalReasoningPlaceholder(stripInternalToolEnvelopeText(part))
             ),
-            annotations: [],
+            annotations: fallbackAnnotations,
           };
         }
         return null;
@@ -899,7 +971,9 @@ function sanitizeResponsesMessageContent(content: unknown): JsonRecord[] {
               stripInternalToolEnvelopeText(toString(partRecord.text) || "")
             )
           ),
-          annotations: Array.isArray(partRecord.annotations) ? partRecord.annotations : [],
+          annotations: Array.isArray(partRecord.annotations)
+            ? partRecord.annotations
+            : fallbackAnnotations,
         };
       }
 
@@ -951,7 +1025,10 @@ function convertOpenAIResponseToResponses(openaiResponse: JsonRecord): JsonRecor
   }
 
   const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
-  const messageContent = sanitizeResponsesMessageContent(message.content);
+  const messageContent = sanitizeResponsesMessageContent(
+    message.content,
+    Array.isArray(message.annotations) ? message.annotations : []
+  );
   if (messageContent.length > 0 || (!hasToolCalls && !reasoningContent)) {
     output.push({
       id: `msg_${responseId}_0`,
@@ -1008,6 +1085,9 @@ function convertOpenAIResponseToResponses(openaiResponse: JsonRecord): JsonRecor
   if (openaiResponse.usage !== undefined) {
     sanitized.usage = sanitizeResponsesUsage(openaiResponse.usage);
   }
+
+  const omniroute = toRecord(openaiResponse.omniroute);
+  if (omniroute) sanitized.omniroute = { ...omniroute };
 
   return sanitized;
 }
@@ -1100,6 +1180,9 @@ export function sanitizeStreamingChunk(parsed: unknown): unknown {
           }
           if (deltaRecord.function_call !== undefined)
             delta.function_call = stripZeroWidthFunctionArguments(deltaRecord.function_call);
+          if (Array.isArray(deltaRecord.annotations)) {
+            delta.annotations = deltaRecord.annotations;
+          }
           c.delta = delta;
         } else {
           c.delta = choiceRecord.delta;
@@ -1123,6 +1206,9 @@ export function sanitizeStreamingChunk(parsed: unknown): unknown {
   if (parsedRecord.system_fingerprint) {
     sanitized.system_fingerprint = parsedRecord.system_fingerprint;
   }
+
+  const omniroute = sanitizeOmniRouteMetadata(parsedRecord.omniroute);
+  if (omniroute) sanitized.omniroute = omniroute;
 
   return sanitized;
 }
