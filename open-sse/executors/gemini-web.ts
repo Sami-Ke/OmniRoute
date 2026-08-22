@@ -17,10 +17,11 @@ import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
 import { buildToolModeResponse } from "./chatgptWebTools.ts";
+import { buildWebResponseObservability } from "../services/webObservability.ts";
 import {
-  buildWebResponseObservability,
-  extractUrlCitationsFromContent,
-} from "../services/webObservability.ts";
+  normalizeCitationsFromResponse,
+  type CitationNormalizationResult,
+} from "../translator/citationNormalizer.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -56,12 +57,102 @@ interface GeminiRequestBody {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function formatChatCompletion(
+const GEMINI_WEB_BROWSER_TEXT_ONLY_SHAPE = "gemini_web.browser_text_only";
+
+type GeminiWebParsedResponse = {
+  content: string;
+  groundingChunks: unknown[];
+  hasGroundingMetadata: boolean;
+};
+
+function unsupportedGeminiWebCitations(): CitationNormalizationResult {
+  return {
+    annotations: [],
+    metadata: {
+      status: "unsupported_shape",
+      sources_detected: 0,
+      invalid_candidates: 0,
+      unknown_shapes: [GEMINI_WEB_BROWSER_TEXT_ONLY_SHAPE],
+    },
+  };
+}
+
+/**
+ * Convert Gemini Web's internal source rows into the public Gemini grounding
+ * chunk shape understood by the shared citation normalizer.
+ *
+ * The Web UI's StreamGenerate payload is not the public Gemini API schema. In
+ * the observed payload, inner[4][0][2][1] is a list of source rows and each
+ * row's [2][0] contains [pageUrl, title, faviconUrl, snippet, ...]. We only
+ * read pageUrl/title from that known source slot; the favicon and rendered
+ * answer text are deliberately excluded from citation candidates.
+ */
+function extractGeminiWebGroundingChunks(inner: unknown): {
+  groundingChunks: unknown[];
+  hasGroundingMetadata: boolean;
+} {
+  const root = Array.isArray(inner) ? inner : [];
+  const answer = Array.isArray(root[4]) && Array.isArray(root[4][0]) ? root[4][0] : null;
+  if (!answer || !Array.isArray(answer[2])) {
+    return { groundingChunks: [], hasGroundingMetadata: false };
+  }
+
+  const sourceRows = answer[2][1];
+  if (sourceRows === undefined) {
+    return { groundingChunks: [], hasGroundingMetadata: false };
+  }
+
+  if (!Array.isArray(sourceRows)) {
+    return {
+      groundingChunks: [{ web: { uri: undefined, title: undefined } }],
+      hasGroundingMetadata: true,
+    };
+  }
+
+  const groundingChunks = sourceRows.map((row) => {
+    const rowRecord =
+      row && typeof row === "object" && !Array.isArray(row)
+        ? (row as Record<string, unknown>)
+        : null;
+    if (rowRecord?.web && typeof rowRecord.web === "object") return rowRecord;
+
+    const rowArray = Array.isArray(row) ? row : [];
+    const sourceDetail =
+      Array.isArray(rowArray[2]) && Array.isArray(rowArray[2][0]) ? rowArray[2][0] : null;
+    return {
+      web: {
+        uri: Array.isArray(sourceDetail) ? sourceDetail[0] : undefined,
+        title: Array.isArray(sourceDetail) ? sourceDetail[1] : undefined,
+      },
+    };
+  });
+
+  return { groundingChunks, hasGroundingMetadata: true };
+}
+
+export function normalizeGeminiWebCitations(
+  groundingChunks: unknown[],
+  hasGroundingMetadata: boolean
+): CitationNormalizationResult {
+  if (!hasGroundingMetadata) return unsupportedGeminiWebCitations();
+  return normalizeCitationsFromResponse({
+    groundingMetadata: { groundingChunks },
+  });
+}
+
+export function formatChatCompletion(
   content: string,
   model: string,
   finishReason = "stop",
-  connectionId?: string | null
+  connectionId?: string | null,
+  citations: CitationNormalizationResult = unsupportedGeminiWebCitations()
 ) {
+  const omniroute = buildWebResponseObservability({
+    channel: "gemini-web",
+    upstreamModel: model,
+    connectionId,
+    content,
+  });
   return {
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion",
@@ -73,28 +164,53 @@ function formatChatCompletion(
         message: {
           role: "assistant",
           content,
-          annotations: extractUrlCitationsFromContent(content),
+          annotations: citations.annotations,
         },
         finish_reason: finishReason,
       },
     ],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    omniroute: buildWebResponseObservability({
-      channel: "gemini-web",
-      upstreamModel: model,
-      connectionId,
-      content,
-    }),
+    omniroute: {
+      ...omniroute,
+      citations: citations.metadata,
+    },
   };
 }
 
-function formatStreamChunk(content: string, model: string, finishReason: string | null = null) {
+export function formatStreamChunk(
+  content: string,
+  model: string,
+  finishReason: string | null = null,
+  connectionId?: string | null,
+  citations: CitationNormalizationResult = unsupportedGeminiWebCitations()
+) {
+  const omniroute = buildWebResponseObservability({
+    channel: "gemini-web",
+    upstreamModel: model,
+    connectionId,
+    content,
+  });
   return {
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
+    choices: [
+      {
+        index: 0,
+        delta: {
+          ...(content ? { content } : {}),
+          ...(content && citations.annotations.length > 0
+            ? { annotations: citations.annotations }
+            : {}),
+        },
+        finish_reason: finishReason,
+      },
+    ],
+    omniroute: {
+      ...omniroute,
+      citations: citations.metadata,
+    },
   };
 }
 
@@ -324,10 +440,11 @@ export async function buildGeminiToolResponse(
   model: string,
   cid: string,
   created: number,
-  connectionId?: string | null
+  connectionId?: string | null,
+  citations: CitationNormalizationResult = unsupportedGeminiWebCitations()
 ): Promise<Response> {
   const bufferedJson = new Response(
-    JSON.stringify(formatChatCompletion(responseText, model, "stop", connectionId)),
+    JSON.stringify(formatChatCompletion(responseText, model, "stop", connectionId, citations)),
     {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -388,9 +505,11 @@ function parseCookies(raw: string): Array<{ name: string; value: string }> {
  * concatenating would reproduce the same growing text with each snapshot
  * (see #7163).
  */
-export function parseStreamResponse(raw: string): string {
+export function parseStreamResponseWithCitations(raw: string): GeminiWebParsedResponse {
   const lines = raw.split("\n");
   let lastText = "";
+  let hasGroundingMetadata = false;
+  const groundingChunks: unknown[] = [];
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -404,14 +523,26 @@ export function parseStreamResponse(raw: string): string {
       const inner = JSON.parse(payload);
       // Defensive: check each level before accessing
       const responseArray = inner?.[4]?.[0]?.[1];
-      if (!Array.isArray(responseArray)) continue;
-      const text = responseArray.filter((c: unknown) => typeof c === "string").join("");
-      if (text) lastText = text;
+      if (Array.isArray(responseArray)) {
+        const text = responseArray.filter((c: unknown) => typeof c === "string").join("");
+        if (text) lastText = text;
+      }
+
+      const frameGrounding = extractGeminiWebGroundingChunks(inner);
+      if (frameGrounding.hasGroundingMetadata) {
+        hasGroundingMetadata = true;
+        groundingChunks.push(...frameGrounding.groundingChunks);
+      }
     } catch {
       // Skip unparseable lines
     }
   }
-  return lastText;
+
+  return { content: lastText, groundingChunks, hasGroundingMetadata };
+}
+
+export function parseStreamResponse(raw: string): string {
+  return parseStreamResponseWithCitations(raw).content;
 }
 
 function readCredentialString(value: unknown): string {
@@ -580,7 +711,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       };
     }
 
-    let browser: any = null;
+    let browser: import("playwright").Browser | null = null;
     let abortBrowser: (() => void) | null = null;
     try {
       if (signal?.aborted) {
@@ -611,14 +742,20 @@ export class GeminiWebExecutor extends BaseExecutor {
 
       // Capture first StreamGenerate response
       let responseText = "";
+      let parsedResponse: GeminiWebParsedResponse = {
+        content: "",
+        groundingChunks: [],
+        hasGroundingMetadata: false,
+      };
       let captured = false;
       const responsePromise = new Promise<void>((resolve) => {
-        page.on("response", async (resp: any) => {
+        page.on("response", async (resp: import("playwright").Response) => {
           if (captured || !resp.url().includes("StreamGenerate")) return;
           captured = true;
           try {
             const raw = await resp.text();
-            responseText = parseStreamResponse(raw);
+            parsedResponse = parseStreamResponseWithCitations(raw);
+            responseText = parsedResponse.content;
           } catch {
             /* ignore */
           }
@@ -676,6 +813,10 @@ export class GeminiWebExecutor extends BaseExecutor {
       await this.persistRotatedCookies(context, cookie, credentials, onCredentialsRefreshed, log);
 
       const modelId = model || "gemini-2.5-pro";
+      const citations = normalizeGeminiWebCitations(
+        parsedResponse.groundingChunks,
+        parsedResponse.hasGroundingMetadata
+      );
 
       if (hasTools) {
         const cid = `chatcmpl-gwe-${crypto.randomUUID().slice(0, 12)}`;
@@ -687,7 +828,8 @@ export class GeminiWebExecutor extends BaseExecutor {
           modelId,
           cid,
           created,
-          credentials?.connectionId
+          credentials?.connectionId,
+          citations
         );
         return { response: toolResponse, url: GEMINI_URL, headers: {}, transformedBody: body };
       }
@@ -701,12 +843,28 @@ export class GeminiWebExecutor extends BaseExecutor {
             start(controller) {
               controller.enqueue(
                 encoder.encode(
-                  `data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`
-                )
+                  `data: ${JSON.stringify(
+                    formatStreamChunk(
+                      responseText,
+                      modelId,
+                      null,
+                      credentials?.connectionId,
+                      citations
+                    )
+                  )}\n\n`
+              )
               );
               controller.enqueue(
                 encoder.encode(
-                  `data: ${JSON.stringify(formatStreamChunk("", modelId, "stop"))}\n\n`
+                  `data: ${JSON.stringify(
+                    formatStreamChunk(
+                      "",
+                      modelId,
+                      "stop",
+                      credentials?.connectionId,
+                      citations
+                    )
+                  )}\n\n`
                 )
               );
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -733,7 +891,13 @@ export class GeminiWebExecutor extends BaseExecutor {
       return {
         response: new Response(
           JSON.stringify(
-            formatChatCompletion(responseText, modelId, "stop", credentials?.connectionId)
+            formatChatCompletion(
+              responseText,
+              modelId,
+              "stop",
+              credentials?.connectionId,
+              citations
+            )
           ),
           {
             status: 200,

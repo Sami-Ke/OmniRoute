@@ -17,7 +17,17 @@ export type TokenSource =
   | { type: "cookie"; name: string; domain?: string }
   | { type: "localStorage"; key: string }
   | { type: "sessionStorage"; key: string }
-  | { type: "header"; name: string };
+  | {
+      type: "header";
+      /** Header name to observe, matched case-insensitively. */
+      name: string;
+      /** Credential field populated by this source (defaults to `name`). */
+      credentialKey?: string;
+      /** Optional allowlist for the request URL carrying the credential. */
+      urlPattern?: RegExp;
+      /** How to turn the observed header value into a credential. */
+      parser?: "raw" | "bearer";
+    };
 
 export interface PollingConfig {
   /** Milliseconds between extraction polls (default 1000) */
@@ -89,6 +99,29 @@ function config(
     successUrlPattern: opts?.successUrlPattern,
     cookieDomain: opts?.cookieDomain,
   };
+}
+
+/** Return the field name used in the extracted credential object. */
+export function getTokenSourceCredentialKey(source: TokenSource): string {
+  if (source.type === "cookie") return source.name;
+  if (source.type === "localStorage" || source.type === "sessionStorage") return source.key;
+  return source.credentialKey || source.name;
+}
+
+/** Check a header source's optional request-URL allowlist. */
+export function matchesTokenSourceUrl(source: TokenSource, url: string): boolean {
+  if (source.type !== "header" || !source.urlPattern) return true;
+  source.urlPattern.lastIndex = 0;
+  return source.urlPattern.test(url);
+}
+
+/** Normalize a captured header without ever widening the source allowlist. */
+export function normalizeTokenSourceValue(source: TokenSource, value: string): string | null {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return null;
+  if (source.type !== "header" || source.parser !== "bearer") return trimmed;
+  const match = trimmed.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
 }
 
 // ─── Configuration Map ──────────────────────────────────────────────────────
@@ -230,9 +263,16 @@ const RAW_CONFIGS: TokenExtractionConfig[] = [
     "Microsoft Copilot",
     "https://copilot.microsoft.com/",
     "https://copilot.microsoft.com",
-    [{ type: "cookie", name: "RPSCAuth", domain: ".microsoft.com" }],
-    "Log in with your Microsoft account at copilot.microsoft.com. The session auth cookie will be extracted.",
-    { cookieDomain: ".microsoft.com" }
+    [
+      {
+        type: "header",
+        name: "authorization",
+        credentialKey: "access_token",
+        parser: "bearer",
+        urlPattern: /^https:\/\/(?:www\.)?copilot\.microsoft\.com\/c\/api\//i,
+      },
+    ],
+    "Log in at copilot.microsoft.com. After sign-in, the Authorization header from a provider-scoped /c/api request will be captured as access_token.",
   ),
 
   // ── DuckDuckGo Web ────────────────────────────────────────

@@ -127,7 +127,7 @@ export const WEB_SESSION_CREDENTIAL_REQUIREMENTS = {
   "copilot-web": {
     kind: "token",
     credentialName: "access_token",
-    placeholder: "access_token=... or paste the raw access_token value",
+    placeholder: "access_token=... or Authorization: Bearer ... from copilot.microsoft.com /c/api",
     acceptsFullCookieHeader: false,
     storageKeys: ["token", "access_token", "accessToken"],
   },
@@ -370,4 +370,30 @@ export function resolveWebSessionImportApiKey(
   if (!requirement || requirement.kind !== "token") return null;
   const trimmed = typeof credential === "string" ? credential.trim() : "";
   return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Resolve the credential that the connection-test validators consume.
+ *
+ * Cookie-kind web-session imports intentionally keep `apiKey` null and store
+ * the full Cookie header in `providerSpecificData.cookie` because executors
+ * read that field. The provider validators, however, receive their primary
+ * credential through `apiKey`; bridge the two storage shapes at validation
+ * time without changing the persisted credential format.
+ */
+export function resolveWebSessionValidationCredential(connection: {
+  authType?: unknown;
+  apiKey?: unknown;
+  providerSpecificData?: unknown;
+}): string | null {
+  const apiKey = typeof connection.apiKey === "string" ? connection.apiKey : null;
+  if (apiKey && apiKey.trim().length > 0) return apiKey;
+
+  if (connection.authType === "cookie" && connection.providerSpecificData) {
+    const data = connection.providerSpecificData as Record<string, unknown>;
+    const cookie = typeof data.cookie === "string" ? data.cookie : null;
+    if (cookie && cookie.trim().length > 0) return cookie;
+  }
+
+  return apiKey;
 }

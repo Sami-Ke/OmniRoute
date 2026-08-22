@@ -223,6 +223,24 @@ export function applyClaudeWebBrowserTemplate(
   };
 }
 
+/**
+ * Claude's authenticated web client advertises web search as a native tool.
+ * A cached browser template remains authoritative; this narrow fallback is
+ * only used by the direct transport when no caller or browser tools exist.
+ */
+export function applyClaudeWebDirectToolFallback(
+  request: ClaudeWebTransportRequest
+): ClaudeWebTransportRequest {
+  if (request.payload.tools.length > 0) return request;
+  return {
+    ...request,
+    payload: {
+      ...request.payload,
+      tools: [{ name: "web_search", type: "web_search_v0" }],
+    },
+  };
+}
+
 function browserFetchHeaders(headers: Record<string, string>): Record<string, string> {
   const forbidden = new Set([
     "accept-encoding",

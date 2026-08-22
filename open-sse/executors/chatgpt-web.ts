@@ -36,6 +36,11 @@ import { isThinkingCapableModel, resolveChatGptModel } from "./chatgpt-web/model
 import { cleanChatGptText, renderChatGptTextWithAnnotations } from "./chatgpt-web/citations.ts";
 import { buildWebResponseObservability } from "../services/webObservability.ts";
 import { resumeChatGptHandoff, type FinalAssistantAnswer } from "./chatgpt-web/handoff.ts";
+import {
+  browserChatGpt,
+  shouldUseChatGptBrowserTransport,
+} from "../services/browserChatGpt.ts";
+import { getCustomUserAgent } from "./base/headers.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -51,6 +56,24 @@ const DEFAULT_PRO_POLL_INTERVAL_MS = 4_000;
 
 const CHATGPT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0";
+
+function resolveChatGptCookie(credentials: ProviderCredentials): string {
+  if (typeof credentials.apiKey === "string" && credentials.apiKey.trim()) {
+    return credentials.apiKey;
+  }
+  const cookie = credentials.providerSpecificData?.cookie;
+  return typeof cookie === "string" ? cookie : "";
+}
+
+function bytesToReadableStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  const chunk = Uint8Array.from(bytes);
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+}
 
 // Captured from a real chatgpt.com browser session (April 2026).
 const OAI_CLIENT_VERSION = "prod-81e0c5cdf6140e8c5db714d613337f4aeab94029";
@@ -1074,6 +1097,119 @@ interface ChatGptStreamEvent {
   v?: unknown;
 }
 
+type ChatGptJsonObject = Record<string, unknown>;
+
+function cloneChatGptJson(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value)) as unknown;
+}
+
+function chatGptJsonPointerSegments(path: string): string[] {
+  if (path === "") return [];
+  return path
+    .split("/")
+    .slice(1)
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+function applyChatGptDeltaOperation(
+  root: unknown,
+  operation: string | undefined,
+  path: string | undefined,
+  value: unknown
+): unknown {
+  if (typeof path !== "string") return root;
+  if (path === "") {
+    return operation === "remove" ? undefined : cloneChatGptJson(value);
+  }
+  if (!root || typeof root !== "object") return root;
+
+  const segments = chatGptJsonPointerSegments(path);
+  if (segments.length === 0) return root;
+  let parent: ChatGptJsonObject | unknown[] = root as ChatGptJsonObject | unknown[];
+  for (let i = 0; i < segments.length - 1; i++) {
+    const segment = segments[i];
+    const nextSegment = segments[i + 1];
+    if (Array.isArray(parent)) {
+      const index = Number(segment);
+      if (!Number.isInteger(index) || index < 0) return root;
+      if (parent[index] === undefined) parent[index] = /^\d+$/.test(nextSegment) ? [] : {};
+      parent = parent[index] as ChatGptJsonObject | unknown[];
+    } else {
+      if (parent[segment] === undefined) parent[segment] = /^\d+$/.test(nextSegment) ? [] : {};
+      parent = parent[segment] as ChatGptJsonObject | unknown[];
+    }
+    if (!parent || typeof parent !== "object") return root;
+  }
+
+  const key = segments[segments.length - 1];
+  if (Array.isArray(parent)) {
+    const index = key === "-" ? parent.length : Number(key);
+    if (!Number.isInteger(index) || index < 0) return root;
+    if (operation === "remove") parent.splice(index, 1);
+    else if (operation === "add") parent.splice(index, 0, cloneChatGptJson(value));
+    else if (operation === "append" && typeof parent[index] === "string")
+      parent[index] = `${parent[index]}${typeof value === "string" ? value : ""}`;
+    else parent[index] = cloneChatGptJson(value);
+    return root;
+  }
+
+  if (operation === "remove") {
+    delete parent[key];
+  } else if (operation === "append") {
+    const current = parent[key];
+    if (typeof current === "string" && typeof value === "string") parent[key] = current + value;
+    else if (Array.isArray(current)) {
+      if (Array.isArray(value)) current.push(...(cloneChatGptJson(value) as unknown[]));
+      else current.push(cloneChatGptJson(value));
+    } else if (current && typeof current === "object" && value && typeof value === "object") {
+      Object.assign(current, cloneChatGptJson(value) as ChatGptJsonObject);
+    } else {
+      parent[key] = cloneChatGptJson(value);
+    }
+  } else {
+    parent[key] = cloneChatGptJson(value);
+  }
+  return root;
+}
+
+function decodeChatGptDeltaEvent(
+  state: unknown,
+  parsed: unknown
+): ChatGptStreamEvent | null {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const delta = parsed as ChatGptJsonObject;
+  let nextState = state;
+
+  if (delta.o === "patch" && Array.isArray(delta.v)) {
+    for (const operation of delta.v) {
+      if (!operation || typeof operation !== "object" || Array.isArray(operation)) continue;
+      const op = operation as ChatGptJsonObject;
+      nextState = applyChatGptDeltaOperation(
+        nextState,
+        typeof op.o === "string" ? op.o : undefined,
+        typeof op.p === "string" ? op.p : undefined,
+        op.v
+      );
+    }
+  } else if (typeof delta.p === "string" || typeof delta.o === "string") {
+    nextState = applyChatGptDeltaOperation(
+      nextState,
+      typeof delta.o === "string" ? delta.o : undefined,
+      typeof delta.p === "string" ? delta.p : undefined,
+      delta.v
+    );
+  } else if (delta.v && typeof delta.v === "object") {
+    // ChatGPT's v1 stream periodically emits a complete cumulative snapshot
+    // without p/o. Keep that snapshot as the current state before applying
+    // any later patch operations.
+    nextState = cloneChatGptJson(delta.v);
+  }
+
+  if (!nextState || typeof nextState !== "object" || Array.isArray(nextState)) return null;
+  return nextState as ChatGptStreamEvent;
+}
+
 /**
  * A part inside `content.parts` for a `multimodal_text` content_type.
  * ChatGPT puts image references in a part with content_type "image_asset_pointer"
@@ -1097,6 +1233,8 @@ async function* readChatGptSseEvents(
   let buffer = "";
   let dataLines: string[] = [];
   let eventName: string | null = null;
+  let deltaEncoding: string | null = null;
+  let deltaState: unknown = null;
 
   function flush(): ChatGptStreamEvent | null | "done" {
     if (dataLines.length === 0) {
@@ -1110,9 +1248,34 @@ async function* readChatGptSseEvents(
     const trimmed = payload.trim();
     if (!trimmed || trimmed === "[DONE]") return "done";
     try {
-      const parsed = JSON.parse(trimmed) as ChatGptStreamEvent;
-      if (sseEventName && !parsed.type) parsed.type = sseEventName;
-      return parsed;
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (sseEventName === "delta_encoding") {
+        deltaEncoding = typeof parsed === "string" ? parsed : null;
+        if (deltaEncoding && deltaEncoding !== "v1") {
+          console.warn(`[chatgpt-web] unsupported delta encoding: ${deltaEncoding}`);
+        }
+        return null;
+      }
+      if (sseEventName === "delta") {
+        if (deltaEncoding === "v1" || deltaEncoding === null) {
+          const decoded = decodeChatGptDeltaEvent(deltaState, parsed);
+          if (decoded) {
+            deltaState = decoded;
+            return decoded;
+          }
+        }
+        return null;
+      }
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        sseEventName &&
+        !(parsed as ChatGptJsonObject).type
+      ) {
+        (parsed as ChatGptJsonObject).type = sseEventName;
+      }
+      return parsed as ChatGptStreamEvent;
     } catch {
       console.warn("[chatgpt-web] stream event JSON parse failed");
       return null;
@@ -1666,9 +1829,33 @@ function buildStreamingResponse(
   // Legacy fallback for handoffs that omit the conduit token.
   pollFinalAnswer: ((conversationId: string) => Promise<FinalAssistantAnswer | null>) | null,
   log: { warn?: (tag: string, msg: string) => void } | null,
+  connectionId?: string | null,
   signal?: AbortSignal | null
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
+
+  const buildStreamOmniRouteMetadata = (
+    content: string,
+    annotations: ReturnType<typeof renderChatGptTextWithAnnotations>["annotations"]
+  ) => ({
+    ...buildWebResponseObservability({
+      channel: "chatgpt-web",
+      upstreamModel: model,
+      connectionId,
+      content,
+    }),
+    citations: {
+      status: annotations.length > 0 ? "found" : "none",
+      sources_detected: annotations.length,
+      invalid_candidates: 0,
+      unknown_shapes: [],
+    },
+    provenance: {
+      upstream_provider: "chatgpt-web",
+      upstream_model: model,
+      fallback_used: false,
+    },
+  });
 
   return new ReadableStream(
     {
@@ -1685,6 +1872,7 @@ function buildStreamingResponse(
                 choices: [
                   { index: 0, delta: { role: "assistant" }, finish_reason: null, logprobs: null },
                 ],
+                omniroute: buildStreamOmniRouteMetadata("", []),
               })
             )
           );
@@ -1697,6 +1885,9 @@ function buildStreamingResponse(
           let emittedText = "";
           let polledFinalAnswer: FinalAssistantAnswer | null = null;
           let parentCandidateMessageId: string | null = null;
+          let finalAnnotations: ReturnType<typeof renderChatGptTextWithAnnotations>["annotations"] =
+            [];
+          let finalRenderedContent = "";
 
           const emitRenderedDelta = (content: string): void => {
             if (!content) return;
@@ -1805,6 +1996,12 @@ function buildStreamingResponse(
             }
 
             if (chunk.done) {
+              const rendered = renderChatGptTextWithAnnotations(
+                chunk.answer || emittedText,
+                chunk.metadata
+              );
+              finalAnnotations = rendered.annotations;
+              finalRenderedContent = rendered.content;
               imagePointers = chunk.imagePointers;
               imageGenAsync = chunk.imageGenAsync ?? false;
               handoff = handoff || (chunk.handoff ?? false);
@@ -1954,6 +2151,36 @@ function buildStreamingResponse(
               return;
           }
 
+          const finalOmniRouteMetadata = buildStreamOmniRouteMetadata(
+            finalRenderedContent || emittedText,
+            finalAnnotations
+          );
+          if (finalAnnotations.length > 0) {
+            if (
+              !safeEnqueue(
+                encoder.encode(
+                  sseChunk({
+                    id: cid,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    system_fingerprint: null,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { annotations: finalAnnotations },
+                        finish_reason: null,
+                        logprobs: null,
+                      },
+                    ],
+                    omniroute: finalOmniRouteMetadata,
+                  })
+                )
+              )
+            )
+              return;
+          }
+
           if (
             !safeEnqueue(
               encoder.encode(
@@ -1964,6 +2191,7 @@ function buildStreamingResponse(
                   model,
                   system_fingerprint: null,
                   choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
+                  omniroute: finalOmniRouteMetadata,
                 })
               )
             )
@@ -2719,7 +2947,7 @@ async function pollForAsyncImage(
         if (!newest || at >= newest.at) newest = { pointers, at };
       }
       if (newest) {
-        ctx.log?.info?.(
+        ctx.log?.debug?.(
           "CGPT-WEB",
           `Recovered ${newest.pointers.length} image pointer(s) via conversation poll (websocket yielded none)`
         );
@@ -2804,6 +3032,109 @@ function makeImageResolver(ctx: ResolverContext): ImageResolver {
 
 // ─── Executor ───────────────────────────────────────────────────────────────
 
+function buildBrowserChatGptPrompt(parsed: ParsedMessages): string {
+  const parts: string[] = [];
+  if (parsed.systemMsg.trim()) parts.push(`System instructions:\n${parsed.systemMsg.trim()}`);
+  if (parsed.history.length > 0) {
+    parts.push(
+      `Prior conversation:\n${parsed.history
+        .map((entry) => `${entry.role === "assistant" ? "Assistant" : "User"}: ${entry.content}`)
+        .join("\n\n")}`
+    );
+  }
+  if (parsed.currentMsg.trim()) parts.push(parsed.currentMsg.trim());
+  return parts.join("\n\n");
+}
+
+async function executeBrowserChatGptTransport({
+  model,
+  parsed,
+  stream,
+  cookie,
+  userAgent,
+  signal,
+  log,
+  connectionId,
+  body,
+  providerSpecificData,
+}: {
+  model: string;
+  parsed: ParsedMessages;
+  stream: boolean;
+  cookie: string;
+  userAgent?: string | null;
+  signal?: AbortSignal | null;
+  log: ExecuteInput["log"];
+  connectionId?: string | null;
+  body: unknown;
+  providerSpecificData?: Record<string, unknown>;
+}) {
+  const browserResult = await browserChatGpt({
+    cookieString: cookie,
+    userMessage: buildBrowserChatGptPrompt(parsed),
+    modelSlug: resolveChatGptModel(model, body, providerSpecificData).slug,
+    userAgent,
+    signal,
+  });
+  if (browserResult.status < 200 || browserResult.status >= 300 || browserResult.body.length === 0) {
+    const status = browserResult.status >= 400 ? browserResult.status : 502;
+    const response = new Response(
+      browserResult.body.length > 0
+        ? browserResult.body.toString("utf8")
+        : JSON.stringify({ error: { message: "ChatGPT browser transport returned an empty response" } }),
+      {
+        status,
+        headers: { "Content-Type": browserResult.contentType || "application/json" },
+      }
+    );
+    return { response, url: CONV_URL, headers: {}, transformedBody: body };
+  }
+
+  const cid = `chatcmpl-cgpt-browser-${crypto.randomUUID().slice(0, 12)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const eventStream = bytesToReadableStream(browserResult.body);
+  const finalResponse = stream
+    ? new Response(
+        buildStreamingResponse(
+          eventStream,
+          model,
+          cid,
+          created,
+          null,
+          null,
+          null,
+          null,
+          log,
+          connectionId,
+          signal
+        ),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+          },
+        }
+      )
+    : await buildNonStreamingResponse(
+        eventStream,
+        model,
+        cid,
+        created,
+        parsed.currentMsg,
+        null,
+        null,
+        null,
+        null,
+        log,
+        connectionId,
+        signal
+      );
+
+  return { response: finalResponse, url: CONV_URL, headers: {}, transformedBody: body };
+}
+
 export class ChatGptWebExecutor extends BaseExecutor {
   constructor() {
     super("chatgpt-web", { id: "chatgpt-web", baseUrl: CONV_URL });
@@ -2837,7 +3168,8 @@ export class ChatGptWebExecutor extends BaseExecutor {
       messages as Array<{ role: string; content: unknown }>
     );
 
-    if (!credentials.apiKey) {
+    const cookie = resolveChatGptCookie(credentials);
+    if (!cookie.trim()) {
       return {
         response: errorResponse(
           401,
@@ -2849,11 +3181,35 @@ export class ChatGptWebExecutor extends BaseExecutor {
       };
     }
 
+    const browserParsed = parseOpenAIMessages(effectiveMessages);
+    const browserPlainTextOnly =
+      !hasTools &&
+      !!browserParsed.currentMsg.trim() &&
+      !browserParsed.latestImageContext &&
+      !looksLikeImageGenRequest(browserParsed) &&
+      !looksLikeImageEditRequest(browserParsed);
+    if (shouldUseChatGptBrowserTransport() && browserPlainTextOnly) {
+      log?.info?.(
+        "CGPT-WEB",
+        "Using browser-owned ChatGPT conversation transport (explicit opt-in)"
+      );
+      return executeBrowserChatGptTransport({
+        model,
+        parsed: browserParsed,
+        stream,
+        cookie,
+        userAgent: getCustomUserAgent(credentials.providerSpecificData),
+        signal,
+        log,
+        connectionId: credentials.connectionId,
+        body,
+        providerSpecificData: credentials.providerSpecificData,
+      });
+    }
+
     // Pass the user's pasted cookie blob through to exchangeSession; the helper
     // accepts bare values, unchunked cookies, chunked (.0/.1) cookies, and full
     // "Cookie: ..." DevTools lines.
-    const cookie = credentials.apiKey;
-
     // 1. Token exchange
     let tokenEntry: TokenEntry;
     try {
@@ -3210,6 +3566,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
         resumeFinalAnswer,
         pollFinalAnswer,
         log,
+        credentials?.connectionId,
         signal
       );
       if (toolMode) {

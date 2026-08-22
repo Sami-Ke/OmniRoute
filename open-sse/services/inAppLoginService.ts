@@ -13,7 +13,13 @@
  */
 
 import { EventEmitter } from "events";
-import { TOKEN_EXTRACTION_CONFIGS, TokenExtractionConfig, type TokenSource } from "./tokenExtractionConfig";
+import {
+  getTokenSourceCredentialKey,
+  matchesTokenSourceUrl,
+  normalizeTokenSourceValue,
+  TOKEN_EXTRACTION_CONFIGS,
+  TokenExtractionConfig,
+} from "./tokenExtractionConfig";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -83,7 +89,7 @@ export class InAppLoginService extends EventEmitter {
     const providerId = config.providerId;
 
     // Dynamically import Playwright (it's a heavy dep, only load when needed)
-    let playwright: any;
+    let playwright: typeof import("playwright");
     try {
       playwright = await import("playwright");
     } catch {
@@ -106,6 +112,42 @@ export class InAppLoginService extends EventEmitter {
         locale: "en-US",
       });
       const page = await context.newPage();
+      const tokenSources = config.tokenSources;
+      const headerSources = tokenSources.filter((source) => source.type === "header");
+      const credentials: Record<string, string> = {};
+      const pendingHeaderCaptures = new Set<Promise<void>>();
+
+      // Capture only explicitly configured headers on explicitly configured URLs.
+      // The value stays in memory and is never logged or returned outside the
+      // existing credential result object.
+      const captureRequestHeaders = async (request: import("playwright").Request): Promise<void> => {
+        try {
+          const requestUrl = request.url();
+          for (const source of headerSources) {
+            if (!matchesTokenSourceUrl(source, requestUrl)) continue;
+            const headers = (await request.headers()) as Record<string, string>;
+            const matched = Object.entries(headers).find(
+              ([name]) => name.toLowerCase() === source.name.toLowerCase()
+            );
+            if (!matched) continue;
+            const normalized = normalizeTokenSourceValue(source, matched[1]);
+            if (normalized) {
+              credentials[getTokenSourceCredentialKey(source)] = normalized;
+            }
+          }
+        } catch {
+          // Request headers may be unavailable while a page is closing.
+        }
+      };
+
+      page.on("request", (request: import("playwright").Request) => {
+        const capture = captureRequestHeaders(request);
+        pendingHeaderCaptures.add(capture);
+        void capture.then(
+          () => pendingHeaderCaptures.delete(capture),
+          () => pendingHeaderCaptures.delete(capture)
+        );
+      });
 
       // Navigate to login URL
       this.emit("status", { providerId, status: "navigating", message: `Loading ${config.loginUrl}` });
@@ -113,7 +155,6 @@ export class InAppLoginService extends EventEmitter {
 
       // Poll for success URL + token extraction
       const maxPolls = Math.floor(maxTimeout / pollInterval);
-      const credentials: Record<string, string> = {};
       const startTime = Date.now();
 
       for (let i = 0; i < maxPolls; i++) {
@@ -137,16 +178,19 @@ export class InAppLoginService extends EventEmitter {
           continue;
         }
 
+        // Let any authenticated request events finish before checking the
+        // required header source.
+        await Promise.all([...pendingHeaderCaptures]);
+
         // Gather cookies from browser context
         const cookies = await context.cookies();
-        const tokenSources = config.tokenSources;
 
         // Check cookie-based sources
         for (const source of tokenSources) {
           if (source.type === "cookie") {
             const domain = source.domain || undefined;
             const matched = cookies.find(
-              (c: any) =>
+              (c) =>
                 c.name === source.name &&
                 (!domain || c.domain.includes(domain.replace(/^\./, "")))
             );
@@ -181,9 +225,7 @@ export class InAppLoginService extends EventEmitter {
         }
 
         // Check if all required tokens are found
-        const requiredKeys = tokenSources.map((s) =>
-          s.type === "cookie" ? s.name : s.type === "localStorage" || s.type === "sessionStorage" ? s.key : s.name
-        );
+        const requiredKeys = tokenSources.map(getTokenSourceCredentialKey);
         const allFound = requiredKeys.every((k) => credentials[k] !== undefined);
 
         if (allFound && Object.keys(credentials).length > 0) {

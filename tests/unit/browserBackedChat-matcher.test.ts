@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { chatUrlMatcher } from "../../open-sse/services/browserBackedChat.ts";
+import { chatUrlsMatcher, chatUrlMatcher } from "../../open-sse/services/browserBackedChat.ts";
 
 describe("chatUrlMatcher", () => {
   it("matches exact URL", () => {
@@ -32,6 +32,20 @@ describe("chatUrlMatcher", () => {
         "https://duck.ai/duckchat/v1/chat",
         "duck.ai",
         "https://duck.ai/duckchat/v1/chat"
+      ),
+      true
+    );
+  });
+
+  it("matches one of several equivalent provider endpoints", () => {
+    assert.equal(
+      chatUrlsMatcher(
+        "https://chatgpt.com/backend-anon/f/conversation",
+        "chatgpt.com",
+        [
+          "https://chatgpt.com/backend-api/f/conversation",
+          "https://chatgpt.com/backend-anon/f/conversation",
+        ]
       ),
       true
     );

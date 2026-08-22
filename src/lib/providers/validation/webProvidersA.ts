@@ -299,6 +299,36 @@ export async function validateGrokWebProvider({ apiKey, providerSpecificData = {
       };
     }
 
+    // The browser-owned WebSocket path is the authoritative validation route when
+    // enabled. Grok binds its clearance to the browser fingerprint, so a direct
+    // TLS probe can report a Cloudflare failure even though the same connection
+    // succeeds through the browser transport used for real chat requests.
+    const browserTransportFlag = String(process.env.OMNIROUTE_GROK_BROWSER_TRANSPORT || "")
+      .trim()
+      .toLowerCase();
+    if (["1", "true", "on"].includes(browserTransportFlag)) {
+      const { browserGrokChat } = await import("@omniroute/open-sse/services/browserGrokChat.ts");
+      const browserResult = await browserGrokChat({
+        cookieString: String(apiKey || ""),
+        userMessage: "Reply with exactly the single word OK.",
+        userAgent:
+          typeof providerSpecificData?.customUserAgent === "string"
+            ? providerSpecificData.customUserAgent
+            : null,
+      });
+      if (browserResult.status >= 200 && browserResult.status < 300 && browserResult.body.length > 0) {
+        return {
+          valid: true,
+          error: null,
+          warning: "Validated through the browser-owned Grok WebSocket transport.",
+        };
+      }
+      return {
+        valid: false,
+        error: `Grok browser transport returned HTTP ${browserResult.status}`,
+      };
+    }
+
     // Use the TLS-impersonating client — Cloudflare on grok.com pins
     // cf_clearance to JA3/JA4 + HTTP/2 SETTINGS, so plain Node fetch always
     // gets "Request rejected by anti-bot rules." regardless of cookies (#3180).

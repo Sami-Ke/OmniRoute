@@ -11,7 +11,10 @@ import assert from "node:assert/strict";
 const {
   TOKEN_EXTRACTION_CONFIGS,
   getExtractionConfig,
+  getTokenSourceCredentialKey,
   listExtractionConfigs,
+  matchesTokenSourceUrl,
+  normalizeTokenSourceValue,
 } = await import("../../open-sse/services/tokenExtractionConfig.ts");
 
 describe("tokenExtractionConfig", () => {
@@ -60,8 +63,31 @@ describe("tokenExtractionConfig", () => {
           assert.ok(typeof src.key === "string", `${providerId}: storage source missing key`);
           assert.ok(src.key.length > 0, `${providerId}: storage source has empty key`);
         }
+        if (src.type === "header") {
+          assert.ok(typeof src.name === "string", `${providerId}: header source missing name`);
+          assert.ok(src.name.length > 0, `${providerId}: header source has empty name`);
+        }
       }
     }
+  });
+
+  it("captures Copilot access_token from an allowlisted bearer header", () => {
+    const cfg = getExtractionConfig("copilot-web");
+    assert.ok(cfg);
+    assert.equal(cfg.tokenSources.length, 1);
+    const [source] = cfg.tokenSources;
+    if (source.type !== "header") throw new Error("Copilot source must be a header source");
+    assert.equal(source.name, "authorization");
+    assert.equal(getTokenSourceCredentialKey(source), "access_token");
+    assert.equal(
+      matchesTokenSourceUrl(source, "https://copilot.microsoft.com/c/api/conversations"),
+      true
+    );
+    assert.equal(matchesTokenSourceUrl(source, "https://copilot.microsoft.com/"), false);
+    assert.equal(
+      normalizeTokenSourceValue(source, "Bearer captured-token"),
+      "captured-token"
+    );
   });
 
   it("loginUrl and homeUrl share the same root domain", () => {

@@ -5,7 +5,15 @@ import { join } from "node:path";
 import { getProviderConnectionById, updateProviderConnection } from "@/lib/db/providers";
 import { validateProviderApiKey } from "@/lib/providers/validation";
 import { VNC_CONFIG, getVncProvider } from "./manifest";
-import { harvestFromContainer, harvestToCredentials, waitForCdpReady } from "./harvest";
+import {
+  buildManualCredentialExport,
+  harvestFromContainer,
+  harvestToCredentials,
+  startNetworkCredentialCapture,
+  waitForCdpReady,
+  type ManualCredentialExport,
+  type NetworkCredentialCapture,
+} from "./harvest";
 
 export type VncSessionStatus = "starting" | "running" | "harvesting" | "stopping" | "error";
 
@@ -38,8 +46,15 @@ export interface HarvestSessionResult {
   } | null;
 }
 
+export interface ExportSessionCredentialsResult extends ManualCredentialExport {
+  sessionId: string;
+  connectionId: string;
+  capturedAt: string;
+}
+
 const LABEL = "com.omniroute.browser-login";
 const SESSIONS = new Map<string, VncSession>();
+const NETWORK_CAPTURES = new Map<string, NetworkCredentialCapture>();
 let idleTimer: NodeJS.Timeout | null = null;
 let reconciliationPromise: Promise<void> | null = null;
 
@@ -90,16 +105,17 @@ export function getSession(connectionId: string, sessionId: string): VncSession 
 
 export function listSessions(connectionId?: string): VncSession[] {
   const sessions = [...SESSIONS.values()];
-  return connectionId ? sessions.filter((session) => session.connectionId === connectionId) : sessions;
+  return connectionId
+    ? sessions.filter((session) => session.connectionId === connectionId)
+    : sessions;
 }
 
 async function reconcileStaleContainers(): Promise<void> {
   if (!reconciliationPromise) {
     reconciliationPromise = (async () => {
-      const listed = await docker(
-        ["ps", "-aq", "--filter", `label=${LABEL}=true`],
-        { timeoutMs: 20_000 }
-      );
+      const listed = await docker(["ps", "-aq", "--filter", `label=${LABEL}=true`], {
+        timeoutMs: 20_000,
+      });
       if (listed.code !== 0) return;
       const ids = listed.out
         .split(/\s+/)
@@ -158,6 +174,24 @@ export async function startSession(connectionId: string): Promise<VncSession> {
   const connection = await getProviderConnectionById(connectionId);
   if (!connection) throw new Error("Provider connection not found");
   const providerId = typeof connection.provider === "string" ? connection.provider : "";
+  return startSessionForProvider(connectionId, providerId);
+}
+
+/**
+ * Start a browser-login session without creating or modifying a provider
+ * connection. This is the first-step flow used to capture credentials for a
+ * remote OmniRoute instance such as Zeabur.
+ */
+export async function startProviderSession(providerId: string): Promise<VncSession> {
+  await reconcileStaleContainers();
+  const connectionId = `manual-${providerId}-${randomUUID()}`;
+  return startSessionForProvider(connectionId, providerId);
+}
+
+async function startSessionForProvider(
+  connectionId: string,
+  providerId: string
+): Promise<VncSession> {
   const provider = getVncProvider(providerId);
   if (!provider) {
     throw new Error(`Browser login is not supported for provider '${providerId || "unknown"}'`);
@@ -232,6 +266,21 @@ export async function startSession(connectionId: string): Promise<VncSession> {
     state.cdpPort = await publishedPort(containerName, VNC_CONFIG.containerCdpPort);
     await waitForCdpReady(state.cdpPort, VNC_CONFIG.browserReadyTimeoutMs);
 
+    // Network capture is optional and best-effort. Cookie/storage providers
+    // remain usable if a provider redirects before its page target is ready.
+    if (provider.networkCapture) {
+      try {
+        const capture = await startNetworkCredentialCapture(
+          state.cdpPort,
+          provider,
+          Math.min(VNC_CONFIG.browserReadyTimeoutMs, 15_000)
+        );
+        if (capture) NETWORK_CAPTURES.set(sessionId, capture);
+      } catch {
+        // The regular CDP harvest still handles cookies and declared storage.
+      }
+    }
+
     state.status = "running";
     scheduleIdleSweep();
     return state;
@@ -239,6 +288,8 @@ export async function startSession(connectionId: string): Promise<VncSession> {
     state.status = "error";
     state.error = error instanceof Error ? error.message : String(error);
     SESSIONS.delete(sessionId);
+    NETWORK_CAPTURES.get(sessionId)?.close();
+    NETWORK_CAPTURES.delete(sessionId);
     await docker(["rm", "-f", containerName], { timeoutMs: 20_000 });
     cleanupProfile(state);
     throw new Error(`Failed to start browser login for connection ${connectionId}: ${state.error}`);
@@ -268,7 +319,8 @@ export async function harvestSession(
     const harvest = await harvestFromContainer(
       session.cdpPort,
       provider,
-      VNC_CONFIG.harvestTimeoutMs
+      VNC_CONFIG.harvestTimeoutMs,
+      NETWORK_CAPTURES.get(sessionId)?.snapshot()
     );
     session.lastHarvestAt = Date.now();
     if (!harvest.hasCredential) {
@@ -335,12 +387,54 @@ export async function harvestSession(
   }
 }
 
+/**
+ * Capture the currently signed-in browser session for explicit manual handoff.
+ * This deliberately does not write the credential to the connection or call a
+ * provider validator. The caller must opt in to this endpoint and copy the
+ * returned value into the target OmniRoute instance themselves.
+ */
+export async function exportSessionCredentials(
+  connectionId: string,
+  sessionId: string
+): Promise<ExportSessionCredentialsResult> {
+  const session = getSession(connectionId, sessionId);
+  if (!session) throw new Error("Browser-login session not found");
+  if (session.status !== "running") {
+    throw new Error(`Browser-login session is not running (${session.status})`);
+  }
+
+  const provider = getVncProvider(session.providerId);
+  if (!provider) throw new Error("Provider is no longer supported for browser login");
+
+  session.status = "harvesting";
+  try {
+    const harvest = await harvestFromContainer(
+      session.cdpPort,
+      provider,
+      VNC_CONFIG.harvestTimeoutMs,
+      NETWORK_CAPTURES.get(sessionId)?.snapshot()
+    );
+    session.lastHarvestAt = Date.now();
+
+    return {
+      ...buildManualCredentialExport(harvest, provider),
+      sessionId,
+      connectionId,
+      capturedAt: new Date().toISOString(),
+    };
+  } finally {
+    if (session.status === "harvesting") session.status = "running";
+  }
+}
+
 export async function stopSession(connectionId: string, sessionId: string): Promise<void> {
   const session = getSession(connectionId, sessionId);
   if (!session || session.status === "stopping") return;
 
   session.status = "stopping";
   SESSIONS.delete(sessionId);
+  NETWORK_CAPTURES.get(sessionId)?.close();
+  NETWORK_CAPTURES.delete(sessionId);
   try {
     const result = await docker(["rm", "-f", session.containerName], { timeoutMs: 20_000 });
     if (result.code !== 0 && !/no such container/i.test(result.err)) {

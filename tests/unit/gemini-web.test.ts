@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { GeminiWebExecutor, parseStreamResponse } =
+const {
+  GeminiWebExecutor,
+  formatChatCompletion,
+  formatStreamChunk,
+  normalizeGeminiWebCitations,
+  parseStreamResponse,
+  parseStreamResponseWithCitations,
+} =
   await import("../../open-sse/executors/gemini-web.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
 
@@ -291,4 +298,87 @@ test("parseStreamResponse keeps only the final cumulative StreamGenerate snapsho
 test("parseStreamResponse ignores wrb.fr lines whose first entry is not an array", () => {
   const raw = `)]}'\n10\n${JSON.stringify(["wrb.fr", null, "[]"])}`;
   assert.equal(parseStreamResponse(raw), "");
+});
+
+function makeGroundedFrame(
+  text: string,
+  sources: Array<{ url: string; title: string }>
+): string {
+  const inner = new Array(80).fill(null);
+  const answer = new Array(38).fill(null);
+  answer[1] = [text];
+  answer[2] = [
+    null,
+    sources.map(({ url, title }) => [
+      null,
+      null,
+      [[url, title, "https://encrypted-tbn.example/favicon", "rendered snippet"]],
+      "source",
+    ]),
+  ];
+  inner[4] = [answer];
+  return `[${JSON.stringify(["wrb.fr", null, JSON.stringify(inner)])}]`;
+}
+
+test("parseStreamResponseWithCitations extracts Gemini Web source URL/title slots", () => {
+  const raw = makeGroundedFrame("Weather answer", [
+    { url: "https://weather.example/taipei", title: "Taipei weather" },
+  ]);
+
+  const parsed = parseStreamResponseWithCitations(raw);
+
+  assert.equal(parsed.content, "Weather answer");
+  assert.equal(parsed.hasGroundingMetadata, true);
+  assert.deepEqual(parsed.groundingChunks, [
+    { web: { uri: "https://weather.example/taipei", title: "Taipei weather" } },
+  ]);
+});
+
+test("Gemini Web citation normalization deduplicates URLs and rejects non-http sources", () => {
+  const result = normalizeGeminiWebCitations(
+    [
+      { web: { uri: "https://weather.example/taipei", title: "Taipei weather" } },
+      { web: { uri: "https://weather.example/taipei#today", title: "Duplicate" } },
+      { web: { uri: "ftp://weather.example/taipei", title: "Invalid protocol" } },
+    ],
+    true
+  );
+
+  assert.equal(result.annotations.length, 1);
+  assert.equal(result.annotations[0].url_citation.url, "https://weather.example/taipei");
+  assert.equal(result.annotations[0].url_citation.title, "Taipei weather");
+  assert.equal(result.metadata.status, "found");
+  assert.equal(result.metadata.sources_detected, 1);
+  assert.equal(result.metadata.invalid_candidates, 1);
+});
+
+test("Gemini Web without source metadata remains diagnostically unsupported", () => {
+  const result = normalizeGeminiWebCitations([], false);
+  assert.deepEqual(result.annotations, []);
+  assert.equal(result.metadata.status, "unsupported_shape");
+  assert.deepEqual(result.metadata.unknown_shapes, ["gemini_web.browser_text_only"]);
+});
+
+test("Gemini Web streaming and non-streaming expose the same normalized citations", () => {
+  const citations = normalizeGeminiWebCitations(
+    [{ web: { uri: "https://weather.example/taipei", title: "Taipei weather" } }],
+    true
+  );
+  const nonStreaming = formatChatCompletion("Weather answer", "gemini-3.1-pro", "stop", null, citations);
+  const streaming = formatStreamChunk("Weather answer", "gemini-3.1-pro", null, null, citations);
+  const streamingTerminal = formatStreamChunk(
+    "",
+    "gemini-3.1-pro",
+    "stop",
+    null,
+    citations
+  );
+
+  assert.deepEqual(
+    nonStreaming.choices[0].message.annotations,
+    streaming.choices[0].delta.annotations
+  );
+  assert.deepEqual(nonStreaming.omniroute.citations, streaming.omniroute.citations);
+  assert.equal(streamingTerminal.choices[0].delta.annotations, undefined);
+  assert.deepEqual(streamingTerminal.omniroute.citations, nonStreaming.omniroute.citations);
 });

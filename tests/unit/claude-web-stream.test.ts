@@ -282,6 +282,145 @@ describe("Claude Web strict stream protocol", () => {
     assert.equal(failures, 0);
   });
 
+  it("accepts internal tool input deltas without exposing their arguments", async () => {
+    const events = [
+      { type: "message_start" },
+      { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "content_block_start",
+        index: 1,
+        content_block: { type: "tool_use", id: "tool-private", name: "web_search" },
+      },
+      {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: '{"query":"private query"}' },
+      },
+      {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "tool_use_block_update_delta", private_tool_state: "running" },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_summary_delta", summary: { summary: "late summary" } },
+      },
+      { type: "content_block_stop", index: 1 },
+      { type: "content_block_start", index: 2, content_block: { type: "text" } },
+      {
+        type: "content_block_delta",
+        index: 2,
+        delta: { type: "text_delta", text: "public answer" },
+      },
+      { type: "content_block_stop", index: 2 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      { type: "message_stop" },
+    ];
+    const response = await createClaudeWebResponse(byteStream(frames(events)), {
+      model: "claude-sonnet-5",
+      stream: false,
+      responseMetadata: {},
+      onComplete() {},
+      onFailure() {},
+    });
+    const raw = await response.text();
+    const body = JSON.parse(raw) as {
+      choices: Array<{ message: { content: string } }>;
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.choices[0].message.content, "public answer");
+    assert.doesNotMatch(raw, /private query|tool-private|web_search/);
+  });
+
+  it("accepts streamed Claude citation deltas and normalizes them", async () => {
+    const events = [
+      { type: "message_start" },
+      { type: "content_block_start", index: 0, content_block: { type: "text" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "answer" } },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "citation_start_delta",
+          citation: {
+            type: "web_search_result_location",
+            url: "https://example.test/claude-live",
+            title: "Claude live source",
+          },
+        },
+      },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      { type: "message_stop" },
+    ];
+
+    const buffered = await createClaudeWebResponse(byteStream(frames(events)), {
+      model: "claude-sonnet-5",
+      stream: false,
+      responseMetadata: {},
+      provenance: {
+        upstream_provider: "claude-web",
+        upstream_model: "claude-sonnet-5",
+        fallback_used: false,
+      },
+      onComplete() {},
+      onFailure() {},
+    });
+    const bufferedBody = (await buffered.json()) as {
+      choices: Array<{
+        message: { content: string; annotations: Array<{ url_citation: { url: string } }> };
+      }>;
+    };
+
+    const streamed = await createClaudeWebResponse(byteStream(frames(events)), {
+      model: "claude-sonnet-5",
+      stream: true,
+      responseMetadata: {},
+      provenance: {
+        upstream_provider: "claude-web",
+        upstream_model: "claude-sonnet-5",
+        fallback_used: false,
+      },
+      onComplete() {},
+      onFailure() {},
+    });
+    const parsed = parseSse(await streamed.text());
+    const streamedAnnotations = parsed.json.flatMap((chunk) => {
+      const choices = chunk.choices as Array<{ delta?: Record<string, unknown> }> | undefined;
+      return choices?.flatMap((choice) => {
+        const annotations = choice.delta?.annotations;
+        return Array.isArray(annotations) ? annotations : [];
+      }) ?? [];
+    }) as Array<{ url_citation: { url: string } }>;
+
+    assert.equal(buffered.status, 200);
+    assert.equal(streamed.status, 200);
+    assert.equal(bufferedBody.choices[0].message.content, "answer");
+    assert.equal(bufferedBody.choices[0].message.annotations[0].url_citation.url, "https://example.test/claude-live");
+    assert.equal(streamedAnnotations[0].url_citation.url, "https://example.test/claude-live");
+    assert.deepEqual(
+      (bufferedBody as { omniroute?: { provenance?: Record<string, unknown> } }).omniroute
+        ?.provenance,
+      {
+        upstream_provider: "claude-web",
+        upstream_model: "claude-sonnet-5",
+        fallback_used: false,
+      }
+    );
+    const streamedProvenance = parsed.json
+      .map((chunk) => chunk.omniroute?.provenance)
+      .find((value) => value && typeof value === "object");
+    assert.deepEqual(streamedProvenance, {
+      upstream_provider: "claude-web",
+      upstream_model: "claude-sonnet-5",
+      fallback_used: false,
+    });
+    assert.equal(parsed.doneCount, 1);
+  });
+
   it("fails closed for malformed, unknown, unordered, upstream error, and premature EOF", async () => {
     const badStreams = [
       'data: {"type":\n\n',

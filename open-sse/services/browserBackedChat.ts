@@ -35,6 +35,7 @@ const COOKIE_POLL_INTERVAL_MS = 500; // Poll for cookies every 500ms
 const COOKIE_POLL_TIMEOUT_MS = 5000; // Max poll time for cookies
 const CIRCUIT_BASE_COOLDOWN_MS = 30_000; // 30s base cooldown
 const CIRCUIT_MAX_COOLDOWN_MS = 600_000; // 10 min max cooldown
+const BROWSER_REQUEST_CAPTURE_TIMEOUT_MS = 30_000;
 
 // Cookie cache — avoids repeated browser launches when cookies are still valid
 interface CachedCookies {
@@ -90,7 +91,7 @@ export function __resetHttpBackedChatOverrideForTesting(): void {
 
 // Helper to make Playwright waitForTimeout abortable via AbortSignal
 function waitWithSignal(ms: number, signal?: AbortSignal | null): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
     const onAbort = () => {
       clearTimeout(timer);
@@ -98,12 +99,18 @@ function waitWithSignal(ms: number, signal?: AbortSignal | null): Promise<void> 
     };
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
-      resolve();
+      resolve(undefined);
     }, ms);
     signal?.addEventListener("abort", onAbort, { once: true });
-  }).catch((err) => {
+  }).catch((err): void => {
     if (err instanceof DOMException && err.name === "AbortError") throw err;
   });
+}
+
+export interface BrowserRequestTemplate {
+  url: string;
+  headers: Record<string, string>;
+  body: string;
 }
 
 export interface BrowserBackedChatRequest {
@@ -118,6 +125,8 @@ export interface BrowserBackedChatRequest {
    * this URL when the user clicks Send, and we capture the response.
    */
   chatUrl: string;
+  /** Additional equivalent chat endpoints exposed by a provider frontend. */
+  chatUrlAlternatives?: readonly string[];
   /**
    * Chat page URL to navigate to before typing. The page must already
    * have its chat UI rendered for the input/button selectors to work.
@@ -183,6 +192,40 @@ export interface BrowserBackedChatRequest {
    * per-context rate limits). Default true.
    */
   reuseContext?: boolean;
+  /**
+   * Capture the provider page's own POST request and replay it from the same
+   * page. This is needed by providers whose request depends on browser-owned
+   * authorization/challenge state in addition to cookies (currently ChatGPT).
+   */
+  replayRequestInBrowser?: boolean;
+  /**
+   * One-shot request captured from an already authenticated browser page.
+   * The template is replayed from the newly opened page so the browser owns
+   * cookies, origin, and fetch semantics while the captured request supplies
+   * short-lived provider authorization state.
+   */
+  browserRequestTemplate?: BrowserRequestTemplate;
+  /**
+   * Optional provider-specific request rewrite applied immediately before
+   * replay. The URL is validated again after rewriting so the callback cannot
+   * redirect the browser replay to an unrelated endpoint.
+   */
+  transformRequest?: (request: BrowserRequestTemplate) => BrowserRequestTemplate;
+  /**
+   * Optional provider-specific recovery while the browser page is still
+   * alive. ChatGPT can return a short handoff stream whose final answer must
+   * be resumed from that same browser session.
+   */
+  resolveResponseBody?: (input: {
+    page: import("playwright").Page;
+    status: number;
+    contentType: string | null;
+    body: Buffer;
+  }) => Promise<{
+    status?: number;
+    contentType?: string | null;
+    body: Buffer;
+  } | null>;
 }
 
 export interface BrowserBackedChatResult {
@@ -196,6 +239,81 @@ export interface BrowserBackedChatResult {
     submitMs: number;
     captureResponseMs: number;
     totalMs: number;
+  };
+}
+
+type CapturedBrowserRequest = BrowserRequestTemplate;
+
+interface ReplayedBrowserResponse {
+  status: number;
+  contentType: string | null;
+  body: Buffer;
+}
+
+const BROWSER_FETCH_FORBIDDEN_HEADERS = new Set([
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "cookie",
+  "host",
+  "origin",
+  "referer",
+  "user-agent",
+]);
+
+/**
+ * Headers that can safely be replayed by a page fetch. Browser-controlled
+ * headers are deliberately omitted; the page supplies those from its own
+ * origin, cookie jar, and browser fingerprint.
+ */
+export function browserReplayHeaders(
+  headers: Record<string, string>
+): Record<string, string> {
+  const filtered: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    const normalized = name.toLowerCase();
+    if (BROWSER_FETCH_FORBIDDEN_HEADERS.has(normalized) || normalized.startsWith("sec-")) {
+      continue;
+    }
+    filtered[name] = value;
+  }
+  return filtered;
+}
+
+async function replayBrowserRequestInPage(
+  page: import("playwright").Page,
+  request: CapturedBrowserRequest
+): Promise<ReplayedBrowserResponse> {
+  const replayed = await page.evaluate(
+    async ({ url, headers, body, maxBytes }) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body,
+        credentials: "include",
+      });
+      const text = await response.text();
+      const bodyBytes = new TextEncoder().encode(text).byteLength;
+      if (bodyBytes > maxBytes) {
+        throw new Error("Browser response exceeded the size limit");
+      }
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        text,
+      };
+    },
+    {
+      url: request.url,
+      headers: browserReplayHeaders(request.headers),
+      body: request.body,
+      maxBytes: MAX_RESPONSE_BYTES,
+    }
+  );
+  return {
+    status: replayed.status,
+    contentType: replayed.contentType,
+    body: Buffer.from(replayed.text, "utf8"),
   };
 }
 
@@ -246,6 +364,14 @@ export function chatUrlMatcher(u: string, matchDomain: string, chatUrl: string):
   return true;
 }
 
+export function chatUrlsMatcher(
+  u: string,
+  matchDomain: string,
+  chatUrls: readonly string[]
+): boolean {
+  return chatUrls.some((chatUrl) => chatUrlMatcher(u, matchDomain, chatUrl));
+}
+
 export async function browserBackedChat(
   req: BrowserBackedChatRequest
 ): Promise<BrowserBackedChatResult> {
@@ -254,6 +380,7 @@ export async function browserBackedChat(
   const {
     poolKey,
     chatUrl,
+    chatUrlAlternatives = [],
     chatPageUrl,
     userMessage,
     cookieString,
@@ -267,7 +394,14 @@ export async function browserBackedChat(
     postSubmitWaitMs = 15000,
     signal,
     reuseContext = true,
+    replayRequestInBrowser = false,
+    browserRequestTemplate,
+    transformRequest,
+    resolveResponseBody,
   } = req;
+  const chatUrls = [chatUrl, ...chatUrlAlternatives];
+  const matchesChatUrl = (url: string): boolean =>
+    chatUrlsMatcher(url, chatUrlMatchDomain, chatUrls);
 
   const { key, acquired: reuseAcquired } = await settlePoolKey(poolKey, reuseContext);
   const tAcquireStart = Date.now();
@@ -292,19 +426,77 @@ export async function browserBackedChat(
     await waitWithSignal(2500, signal);
     const navigateMs = Date.now() - tNavStart;
 
+    if (browserRequestTemplate) {
+      const replayRequest = transformRequest
+        ? transformRequest(browserRequestTemplate)
+        : browserRequestTemplate;
+      if (!matchesChatUrl(replayRequest.url)) {
+        throw new Error("Browser request template does not match the configured chat endpoint");
+      }
+      const tReplayStart = Date.now();
+      const replayed = await replayBrowserRequestInPage(page, replayRequest);
+      let status = replayed.status;
+      let contentType = replayed.contentType;
+      let body = replayed.body;
+      if (resolveResponseBody && status >= 200 && status < 300) {
+        try {
+          const resolved = await resolveResponseBody({ page, status, contentType, body });
+          if (resolved) {
+            status = resolved.status ?? status;
+            contentType = resolved.contentType ?? contentType;
+            body = resolved.body;
+          }
+        } catch (err) {
+          console.warn(
+            `[browserBackedChat] response recovery failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+      const replayMs = Date.now() - tReplayStart;
+      return {
+        status,
+        contentType,
+        body,
+        isStealth: pooled.isStealth,
+        timing: {
+          acquireContextMs,
+          navigateMs,
+          submitMs: replayMs,
+          captureResponseMs: replayMs,
+          totalMs: Date.now() - t0,
+        },
+      };
+    }
+
     const inputLocator = page.locator(inputSelector).first();
     await inputLocator.waitFor({ state: "visible", timeout: 10000, signal: signal ?? undefined });
     await inputLocator.fill(userMessage);
     await waitWithSignal(800, signal);
 
-    const tSubmitStart = Date.now();
-    const responsePromise = page.waitForResponse(
-      (r) =>
-        r.request().method() === "POST" && chatUrlMatcher(r.url(), chatUrlMatchDomain, chatUrl),
-      { timeout: 30000 }
-    );
+    const submitPage = async (): Promise<void> => {
+      if (submitButtonSelector) {
+        const btn = page.locator(submitButtonSelector).first();
+        if ((await btn.count()) > 0) {
+          try {
+            await btn.click({ timeout: 2000 });
+            return;
+          } catch {
+            // Fall through to the keyboard submit path.
+          }
+        }
+      }
+      await page.keyboard.press("Enter");
+    };
 
-    // Wire signal to responsePromise via Promise.race
+    let observedResponse: import("playwright").Response | null = null;
+    let observedResponseBody: Promise<{
+      status: number;
+      headers: Record<string, string>;
+      body: Buffer<ArrayBuffer>;
+    }> | null = null;
+    let replayedResponse: ReplayedBrowserResponse | null = null;
     let abortListener: (() => void) | undefined;
     const signalPromise = signal
       ? new Promise<never>((_, reject) => {
@@ -314,73 +506,223 @@ export async function browserBackedChat(
         })
       : null;
 
-    if (submitButtonSelector) {
-      const btn = page.locator(submitButtonSelector).first();
-      if ((await btn.count()) > 0) {
-        try {
-          await btn.click({ timeout: 2000 });
-        } catch {
-          await page.keyboard.press("Enter");
+    if (replayRequestInBrowser) {
+      let resolveRequest: ((request: CapturedBrowserRequest) => void) | undefined;
+      let rejectRequest: ((error: Error) => void) | undefined;
+      let requestSettled = false;
+      const requestPromise = new Promise<CapturedBrowserRequest>((resolve, reject) => {
+        resolveRequest = resolve;
+        rejectRequest = reject;
+      });
+      // The promise may still reject after a timeout; keep that rejection
+      // from becoming an unhandled process-level error.
+      void requestPromise.catch(() => {});
+
+      const routeMatcher = (url: URL): boolean =>
+        matchesChatUrl(url.toString());
+      const routeHandler = async (route: import("playwright").Route): Promise<void> => {
+        const outgoing = route.request();
+        if (requestSettled || outgoing.method() !== "POST") {
+          await route.continue().catch(() => {});
+          return;
         }
-      } else {
-        await page.keyboard.press("Enter");
+        try {
+          const body = outgoing.postData();
+          if (!body) throw new Error("Browser request body is missing");
+          const captured: CapturedBrowserRequest = {
+            url: outgoing.url(),
+            headers: await outgoing.allHeaders(),
+            body,
+          };
+          try {
+            await route.abort();
+          } catch {
+            await route.continue().catch(() => {});
+          }
+          requestSettled = true;
+          resolveRequest?.(captured);
+        } catch (error) {
+          await route.continue().catch(() => {});
+          if (!requestSettled) {
+            requestSettled = true;
+            rejectRequest?.(
+              error instanceof Error ? error : new Error("Browser request capture failed")
+            );
+          }
+        }
+      };
+
+      await page.route(routeMatcher, routeHandler);
+      let requestTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await submitPage();
+        const tCaptureStart = Date.now();
+        const timeoutPromise = new Promise<null>((resolve) => {
+          requestTimeout = setTimeout(() => resolve(null), BROWSER_REQUEST_CAPTURE_TIMEOUT_MS);
+        });
+        const capturedRequest = signalPromise
+          ? await Promise.race([requestPromise, timeoutPromise, signalPromise]).catch(() => null)
+          : await Promise.race([requestPromise, timeoutPromise]).catch(() => null);
+        if (requestTimeout) clearTimeout(requestTimeout);
+        await page.unroute(routeMatcher, routeHandler).catch(() => {});
+        if (capturedRequest) {
+          const replayRequest = transformRequest
+            ? transformRequest(capturedRequest)
+            : capturedRequest;
+          if (!matchesChatUrl(replayRequest.url)) {
+            throw new Error("Captured browser request does not match the configured chat endpoint");
+          }
+          replayedResponse = await replayBrowserRequestInPage(page, replayRequest);
+        }
+        const captureResponseMs = Date.now() - tCaptureStart;
+        const submitMs = captureResponseMs;
+
+        let status = 0;
+        let contentType: string | null = null;
+        let body: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+        if (replayedResponse) {
+          status = replayedResponse.status;
+          contentType = replayedResponse.contentType;
+          body = replayedResponse.body;
+        }
+
+        if (resolveResponseBody && replayedResponse && status >= 200 && status < 300) {
+          try {
+            const resolved = await resolveResponseBody({ page, status, contentType, body });
+            if (resolved) {
+              status = resolved.status ?? status;
+              contentType = resolved.contentType ?? contentType;
+              body = resolved.body;
+            }
+          } catch (err) {
+            console.warn(
+              `[browserBackedChat] response recovery failed: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+          }
+        }
+
+        return {
+          status,
+          contentType,
+          body,
+          isStealth: pooled.isStealth,
+          timing: {
+            acquireContextMs,
+            navigateMs,
+            submitMs,
+            captureResponseMs,
+            totalMs: Date.now() - t0,
+          },
+        };
+      } finally {
+        if (requestTimeout) clearTimeout(requestTimeout);
+        if (signal && abortListener) {
+          signal.removeEventListener("abort", abortListener);
+        }
+        await page.unroute(routeMatcher, routeHandler).catch(() => {});
       }
     } else {
-      await page.keyboard.press("Enter");
-    }
-    const tCaptureStart = Date.now();
-    const response = signalPromise
-      ? await Promise.race([responsePromise, signalPromise]).catch(() => null)
-      : await responsePromise.catch(() => null);
-    if (signal && abortListener) {
-      signal.removeEventListener("abort", abortListener);
-    }
-    if (response) {
-      // Wait for the upstream SSE to finish streaming
-      await waitWithSignal(Math.min(postSubmitWaitMs, 30000), signal);
-    } else {
-      await waitWithSignal(postSubmitWaitMs, signal);
-    }
-    const captureResponseMs = Date.now() - tCaptureStart;
-    const submitMs = captureResponseMs;
+      const responseListener = (candidate: import("playwright").Response) => {
+        if (
+          !observedResponse &&
+          candidate.request().method() === "POST" &&
+          matchesChatUrl(candidate.url())
+        ) {
+          observedResponse = candidate;
+          // Capture immediately. Some providers' frontend code consumes or
+          // closes a streaming Response after rendering it, so waiting until
+          // the post-submit delay to call response.body() can yield 0 bytes.
+          observedResponseBody = readPageResponseBody(candidate).catch(() => ({
+            status: candidate.status(),
+            headers: {} as Record<string, string>,
+            body: Buffer.alloc(0) as Buffer<ArrayBuffer>,
+          }));
+        }
+      };
+      page.on("response", responseListener);
+      const responsePromise = page.waitForResponse(
+        (r) =>
+          r.request().method() === "POST" && matchesChatUrl(r.url()),
+        { timeout: BROWSER_REQUEST_CAPTURE_TIMEOUT_MS }
+      );
 
-    let status = 0;
-    let contentType: string | null = null;
-    let body = Buffer.alloc(0);
-    if (response) {
-      const captured = await readPageResponseBody(response);
-      // OOM guard: reject responses larger than MAX_RESPONSE_BYTES
-      if (captured.body.length > MAX_RESPONSE_BYTES) {
-        body = Buffer.from(
-          JSON.stringify({
-            error: {
-              message: "Response too large",
-              type: "upstream_error",
-            },
-          })
-        );
-        status = 502;
-        contentType = "application/json";
-      } else {
-        status = captured.status;
-        contentType = captured.headers["content-type"] || null;
-        body = captured.body;
+      await submitPage();
+      const tCaptureStart = Date.now();
+      const response = signalPromise
+        ? await Promise.race([responsePromise, signalPromise]).catch(() => null)
+        : await responsePromise.catch(() => null);
+      const capturedResponse = response ?? observedResponse;
+      if (signal && abortListener) {
+        signal.removeEventListener("abort", abortListener);
       }
-    }
+      if (capturedResponse) {
+        // Wait for the upstream SSE to finish streaming
+        await waitWithSignal(Math.min(postSubmitWaitMs, 30000), signal);
+      } else {
+        await waitWithSignal(postSubmitWaitMs, signal);
+      }
+      const captureResponseMs = Date.now() - tCaptureStart;
+      const submitMs = captureResponseMs;
 
-    return {
-      status,
-      contentType,
-      body,
-      isStealth: pooled.isStealth,
-      timing: {
-        acquireContextMs,
-        navigateMs,
-        submitMs,
-        captureResponseMs,
-        totalMs: Date.now() - t0,
-      },
-    };
+      let status = 0;
+      let contentType: string | null = null;
+      let body: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      if (capturedResponse) {
+        const captured = observedResponseBody
+          ? await observedResponseBody
+          : await readPageResponseBody(capturedResponse);
+        // OOM guard: reject responses larger than MAX_RESPONSE_BYTES
+        if (captured.body.length > MAX_RESPONSE_BYTES) {
+          body = Buffer.from(
+            JSON.stringify({
+              error: {
+                message: "Response too large",
+                type: "upstream_error",
+              },
+            })
+          );
+          status = 502;
+          contentType = "application/json";
+        } else {
+          status = captured.status;
+          contentType = captured.headers["content-type"] || null;
+          body = captured.body;
+        }
+      }
+
+      if (resolveResponseBody && capturedResponse && status >= 200 && status < 300) {
+        try {
+          const resolved = await resolveResponseBody({ page, status, contentType, body });
+          if (resolved) {
+            status = resolved.status ?? status;
+            contentType = resolved.contentType ?? contentType;
+            body = resolved.body;
+          }
+        } catch (err) {
+          console.warn(
+            `[browserBackedChat] response recovery failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+
+      return {
+        status,
+        contentType,
+        body,
+        isStealth: pooled.isStealth,
+        timing: {
+          acquireContextMs,
+          navigateMs,
+          submitMs,
+          captureResponseMs,
+          totalMs: Date.now() - t0,
+        },
+      };
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // Emit a structured JSON error so the executor can wrap it.
@@ -406,6 +748,11 @@ export async function browserBackedChat(
       },
     };
   } finally {
+    try {
+      page.removeAllListeners("response");
+    } catch {
+      /* ignore */
+    }
     await page.close();
     if (!reuseAcquired) {
       // Non-reused contexts are uniquely keyed. Close the page's context

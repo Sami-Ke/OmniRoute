@@ -19,6 +19,7 @@ import { logProxyEvent } from "@/lib/proxyLogger";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { isGitLabDirectAccessDisabled } from "@/lib/oauth/gitlab";
 import { providerAllowsOptionalApiKey } from "@/shared/constants/providers";
+import { resolveWebSessionValidationCredential } from "@/shared/providers/webSessionCredentials";
 import { removeConnectionHealth } from "@omniroute/open-sse/services/apiKeyRotator.ts";
 import { classifyAmbiguousOrAuthError, type ClassifyFailureArgs } from "./mistralAmbiguousAuth";
 import { OAUTH_TEST_CONFIG } from "./oauthTestConfig";
@@ -577,11 +578,15 @@ export async function testOAuthConnection(
 }
 
 /**
- * Test API key connection
+ * Test API-key or imported web-session connection.
+ * Cookie-kind web sessions persist their credential in providerSpecificData.cookie;
+ * resolveWebSessionValidationCredential bridges that storage shape to the
+ * validator's apiKey argument without exposing or rewriting the stored value.
  */
 async function testApiKeyConnection(connection: any) {
+  const validationApiKey = resolveWebSessionValidationCredential(connection);
   const requiresApiKey = !providerAllowsOptionalApiKey(connection.provider);
-  if (requiresApiKey && !connection.apiKey) {
+  if (requiresApiKey && !validationApiKey) {
     const error = "Missing API key";
     return {
       valid: false,
@@ -592,7 +597,7 @@ async function testApiKeyConnection(connection: any) {
 
   const result = await validateProviderApiKey({
     provider: connection.provider,
-    apiKey: connection.apiKey,
+    apiKey: validationApiKey,
     providerSpecificData: connection.providerSpecificData,
   });
 
@@ -668,7 +673,7 @@ export async function testSingleConnection(connectionId: string, validationModel
       refreshed: false,
       diagnosis: (runtime as any).diagnosis,
     };
-  } else if (connection.authType === "apikey") {
+  } else if (connection.authType === "apikey" || connection.authType === "cookie") {
     const enrichedConnection = validationModelId
       ? {
           ...connection,

@@ -31,6 +31,24 @@ function getConfigs() {
   return TOKEN_EXTRACTION_CONFIGS;
 }
 
+function getHeaderCredentialKey(source) {
+  return source.credentialKey || source.name;
+}
+
+function matchesHeaderSourceUrl(source, url) {
+  if (!source.urlPattern) return true;
+  source.urlPattern.lastIndex = 0;
+  return source.urlPattern.test(url);
+}
+
+function normalizeHeaderSourceValue(source, value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) return null;
+  if (source.parser !== "bearer") return trimmed;
+  const match = trimmed.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() || null : null;
+}
+
 class LoginManager extends EventEmitter {
   constructor() {
     super();
@@ -42,6 +60,7 @@ class LoginManager extends EventEmitter {
     this.isCompleted = false;
     this.pollIntervalId = null;
     this.loginSession = null;
+    this.capturedHeaderCredentials = {};
   }
 
   /**
@@ -77,6 +96,7 @@ class LoginManager extends EventEmitter {
 
     this.activeProviderId = providerId;
     this.isCompleted = false;
+    this.capturedHeaderCredentials = {};
 
     const timeout = options.timeout || extractionConfig.pollingConfig.timeout || 300_000;
     const minLoginTime = extractionConfig.pollingConfig.minLoginTime || 5000;
@@ -124,6 +144,41 @@ class LoginManager extends EventEmitter {
     });
 
     const winSession = this.window.webContents.session;
+    this.loginSession = winSession;
+
+    // Capture only provider-configured request headers, and only from the
+    // provider home host. The value remains in memory until the normal login
+    // result is returned; it is never logged.
+    const headerSources = config.tokenSources.filter((source) => source.type === "header");
+    if (headerSources.length > 0) {
+      let hostname = "";
+      try {
+        hostname = new URL(config.homeUrl).hostname;
+      } catch {
+        // A malformed home URL is already invalid config; skip interception.
+      }
+      if (hostname) {
+        winSession.webRequest.onBeforeSendHeaders(
+          { urls: [`https://${hostname}/*`, `http://${hostname}/*`] },
+          (details, callback) => {
+            if (!this.isCompleted) {
+              for (const source of headerSources) {
+                if (!matchesHeaderSourceUrl(source, details.url)) continue;
+                const matched = Object.entries(details.requestHeaders || {}).find(
+                  ([name]) => name.toLowerCase() === source.name.toLowerCase()
+                );
+                if (!matched) continue;
+                const normalized = normalizeHeaderSourceValue(source, matched[1]);
+                if (normalized) {
+                  this.capturedHeaderCredentials[getHeaderCredentialKey(source)] = normalized;
+                }
+              }
+            }
+            callback({ requestHeaders: details.requestHeaders });
+          }
+        );
+      }
+    }
 
     // Track navigation for success URL detection
     let navigatedToLogin = false;
@@ -236,6 +291,8 @@ class LoginManager extends EventEmitter {
 
           const tokenSources = config.tokenSources;
           const credentials = {};
+          const headerSources = tokenSources.filter((s) => s.type === "header");
+          Object.assign(credentials, this.capturedHeaderCredentials);
 
           // Collect all cookie-based sources
           const cookieSources = tokenSources.filter((s) => s.type === "cookie");
@@ -272,13 +329,37 @@ class LoginManager extends EventEmitter {
                 if (values && typeof values === "object") {
                   Object.assign(credentials, values);
                 }
-                this._checkCredentials(providerId, credentials, cookieSources, storageSources, poll, pollInterval);
+                this._checkCredentials(
+                  providerId,
+                  credentials,
+                  cookieSources,
+                  storageSources,
+                  headerSources,
+                  poll,
+                  pollInterval
+                );
               })
               .catch(() => {
-                this._checkCredentials(providerId, credentials, cookieSources, storageSources, poll, pollInterval);
+                this._checkCredentials(
+                  providerId,
+                  credentials,
+                  cookieSources,
+                  storageSources,
+                  headerSources,
+                  poll,
+                  pollInterval
+                );
               });
           } else {
-            this._checkCredentials(providerId, credentials, cookieSources, storageSources, poll, pollInterval);
+            this._checkCredentials(
+              providerId,
+              credentials,
+              cookieSources,
+              storageSources,
+              headerSources,
+              poll,
+              pollInterval
+            );
           }
         })
         .catch(() => {
@@ -295,13 +376,14 @@ class LoginManager extends EventEmitter {
   /**
    * Check if we have all required credentials, otherwise continue polling
    */
-  _checkCredentials(providerId, credentials, cookieSources, storageSources, poll, pollInterval) {
+  _checkCredentials(providerId, credentials, cookieSources, storageSources, headerSources, poll, pollInterval) {
     if (this.isCompleted) return;
 
     // Collect the required source names/keys
     const requiredKeys = [
       ...cookieSources.map((s) => s.name),
       ...storageSources.map((s) => s.key),
+      ...headerSources.map(getHeaderCredentialKey),
     ];
     const foundKeys = Object.keys(credentials);
     const allFound = requiredKeys.every((k) => foundKeys.includes(k));
@@ -373,6 +455,7 @@ class LoginManager extends EventEmitter {
     }
     this.window = null;
     this.loginSession = null;
+    this.capturedHeaderCredentials = {};
   }
 
   /**
