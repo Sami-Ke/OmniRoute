@@ -30,18 +30,6 @@ test("an existing apiKey remains the validation credential", () => {
   );
 });
 
-test("browser recovery replaces stale session chunks and preserves Cloudflare cookies", async () => {
-  const { mergeBrowserChatGptCookie } =
-    await import("../../open-sse/services/chatgptWebBrowserRecovery.ts");
-  assert.equal(
-    mergeBrowserChatGptCookie("__Secure-next-auth.session-token=OLD; cf_clearance=CLEAR", [
-      { name: "__Secure-next-auth.session-token.0", value: "NEW-0" },
-      { name: "__Secure-next-auth.session-token.1", value: "NEW-1" },
-    ]),
-    "cf_clearance=CLEAR; __Secure-next-auth.session-token.0=NEW-0; __Secure-next-auth.session-token.1=NEW-1"
-  );
-});
-
 test("testSingleConnection validates a cookie-authenticated session from the persisted cookie field", async () => {
   const { createProviderConnection, getProviderConnectionById } =
     await import("../../src/lib/db/providers.ts");
@@ -79,52 +67,6 @@ test("testSingleConnection validates a cookie-authenticated session from the per
     assert.equal(persisted?.testStatus, "active");
   } finally {
     globalThis.fetch = originalFetch;
-  }
-});
-
-test("ChatGPT Web validation can repair a still-authenticated browser session", async () => {
-  const { createProviderConnection, getProviderConnectionById } =
-    await import("../../src/lib/db/providers.ts");
-  const { __setTlsFetchOverrideForTesting } =
-    await import("../../open-sse/services/chatgptTlsClient.ts");
-  const { __setChatGptWebBrowserRecoveryOverrideForTesting } =
-    await import("../../open-sse/services/chatgptWebBrowserRecovery.ts");
-  const { testSingleConnection } = await import("../../src/app/api/providers/[id]/test/route.ts");
-
-  const connection = await createProviderConnection({
-    provider: "chatgpt-web",
-    authType: "cookie",
-    name: "chatgpt-web-browser-recovery-fixture",
-    apiKey: null,
-    providerSpecificData: { cookie: "__Secure-next-auth.session-token=OLD" },
-    isActive: true,
-    testStatus: "unknown",
-  });
-
-  __setTlsFetchOverrideForTesting(async () => ({
-    status: 401,
-    headers: new Headers({ "content-type": "application/json" }),
-    text: "{}",
-    body: null,
-  }));
-  __setChatGptWebBrowserRecoveryOverrideForTesting(async () => ({
-    valid: true,
-    refreshedCookie: "cf_clearance=CLEAR; __Secure-next-auth.session-token=NEW",
-  }));
-
-  try {
-    const result = await testSingleConnection(connection.id);
-    assert.equal(result.valid, true, JSON.stringify(result));
-    assert.equal(result.refreshed, true);
-    const persisted = await getProviderConnectionById(connection.id);
-    assert.equal(
-      persisted?.providerSpecificData?.cookie,
-      "cf_clearance=CLEAR; __Secure-next-auth.session-token=NEW"
-    );
-    assert.equal(persisted?.testStatus, "active");
-  } finally {
-    __setTlsFetchOverrideForTesting(null);
-    __setChatGptWebBrowserRecoveryOverrideForTesting(null);
   }
 });
 

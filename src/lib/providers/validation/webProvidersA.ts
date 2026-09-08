@@ -12,10 +12,6 @@ import {
   extractQwenToken,
   normalizeSessionCookieHeader,
 } from "@/lib/providers/webCookieAuth";
-import {
-  buildSessionCookieHeader,
-  mergeRefreshedCookie,
-} from "@omniroute/open-sse/utils/nextAuthCookie.ts";
 
 // kimi-web uses the international `www.kimi.com` Connect-RPC API. The legacy
 // `kimi.moonshot.cn` domain now 307-redirects every non-CN visitor, and even
@@ -512,7 +508,13 @@ export async function validateChatGptWebProvider({ apiKey, providerSpecificData 
   try {
     // Accept bare value, unchunked cookie, chunked (.0/.1) cookies, or full
     // "Cookie: ..." DevTools line. Pass through verbatim once recognised.
-    const cookieHeader = buildSessionCookieHeader(String(apiKey || ""));
+    let cookieHeader = String(apiKey || "").trim();
+    if (/^cookie\s*:\s*/i.test(cookieHeader)) {
+      cookieHeader = cookieHeader.replace(/^cookie\s*:\s*/i, "");
+    }
+    if (!/__Secure-next-auth\.session-token(?:\.\d+)?\s*=/.test(cookieHeader)) {
+      cookieHeader = `__Secure-next-auth.session-token=${cookieHeader}`;
+    }
 
     // Use the TLS-impersonating client — Cloudflare on chatgpt.com pins
     // cf_clearance to JA3/JA4 + HTTP/2 SETTINGS, so plain Node fetch always
@@ -604,12 +606,7 @@ export async function validateChatGptWebProvider({ apiKey, providerSpecificData 
         error: "ChatGPT session expired — log into chatgpt.com and copy a fresh cookie",
       };
     }
-    const refreshedCookie = mergeRefreshedCookie(cookieHeader, response.headers.get("set-cookie"));
-    return {
-      valid: true,
-      error: null,
-      ...(refreshedCookie ? { refreshedCookie } : {}),
-    };
+    return { valid: true, error: null };
   } catch (error: any) {
     return toValidationErrorResult(error);
   }
