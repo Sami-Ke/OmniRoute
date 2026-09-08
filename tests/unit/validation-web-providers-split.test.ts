@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { __setBrowserGrokChatOverrideForTesting } from "../../open-sse/services/browserGrokChat.ts";
+import { __setTlsFetchOverrideForTesting } from "../../open-sse/services/chatgptTlsClient.ts";
 
 const A = await import("../../src/lib/providers/validation/webProvidersA.ts");
 const B = await import("../../src/lib/providers/validation/webProvidersB.ts");
@@ -60,6 +61,31 @@ test("metaAi.buildMetaAiValidationBody emits a persisted-query body with fresh U
 test("host dispatcher surface remains intact after the move", () => {
   assert.equal(typeof (HOST as Record<string, unknown>).validateProviderApiKey, "function");
   assert.equal(typeof (HOST as Record<string, unknown>).validateWebCookieProvider, "function");
+});
+
+test("ChatGPT validation exposes a rotated session cookie for persistence", async () => {
+  __setTlsFetchOverrideForTesting(async () => ({
+    status: 200,
+    headers: new Headers({
+      "Content-Type": "application/json",
+      "set-cookie": "__Secure-next-auth.session-token=ROTATED; Path=/; HttpOnly; Secure",
+    }),
+    text: JSON.stringify({ accessToken: "access-token", user: { id: "user-1" } }),
+    body: null,
+  }));
+
+  try {
+    const result = await A.validateChatGptWebProvider({
+      apiKey: "__Secure-next-auth.session-token=OLD; cf_clearance=CLEAR",
+    });
+    assert.equal(result.valid, true);
+    assert.equal(
+      result.refreshedCookie,
+      "cf_clearance=CLEAR; __Secure-next-auth.session-token=ROTATED"
+    );
+  } finally {
+    __setTlsFetchOverrideForTesting(null);
+  }
 });
 
 test("Grok validation uses the browser transport when it is enabled", async () => {

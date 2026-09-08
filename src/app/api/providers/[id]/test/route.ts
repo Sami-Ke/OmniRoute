@@ -601,6 +601,32 @@ async function testApiKeyConnection(connection: any) {
     providerSpecificData: connection.providerSpecificData,
   });
 
+  // A browser-owned retry can recover a still-authenticated ChatGPT session
+  // when the TLS validator is challenged. It also captures a rotated cookie;
+  // a genuinely expired/revoked session still returns login_required.
+  if (!result.valid && connection.provider === "chatgpt-web" && validationApiKey) {
+    try {
+      const { recoverChatGptWebSession } =
+        await import("@omniroute/open-sse/services/chatgptWebBrowserRecovery.ts");
+      const browserRecovery = await recoverChatGptWebSession(validationApiKey);
+      if (browserRecovery.valid) {
+        return {
+          valid: true,
+          error: null,
+          warning: null,
+          diagnosis: makeDiagnosis("ok", "upstream", null, null),
+          refreshed: !!browserRecovery.refreshedCookie,
+          ...(browserRecovery.refreshedCookie
+            ? { refreshedCookie: browserRecovery.refreshedCookie }
+            : {}),
+        };
+      }
+    } catch {
+      // Keep the original validator diagnosis when the optional browser path
+      // is unavailable; the nightly monitor will report the failure.
+    }
+  }
+
   if (result.unsupported) {
     const error = "Provider test not supported";
     return {
@@ -614,12 +640,20 @@ async function testApiKeyConnection(connection: any) {
   const diagnosis = result.valid
     ? makeDiagnosis("ok", "upstream", null, null)
     : classifyFailure({ error, statusCode: result.statusCode, provider: connection.provider });
+  const refreshedCookie =
+    typeof result.refreshedCookie === "string" && result.refreshedCookie.trim()
+      ? result.refreshedCookie
+      : null;
 
   return {
     valid: !!result.valid,
     error,
     warning: result.warning || null,
     diagnosis,
+    refreshed: !!refreshedCookie,
+    // Internal-only field consumed by testSingleConnection; never return this
+    // credential from the HTTP route.
+    refreshedCookie,
     ...(Array.isArray((result as any).deployments)
       ? { deployments: (result as any).deployments }
       : {}),
@@ -735,6 +769,36 @@ export async function testSingleConnection(connectionId: string, validationModel
     }
     if (result.newTokens.expiresIn) {
       updateData.expiresAt = new Date(Date.now() + result.newTokens.expiresIn * 1000).toISOString();
+    }
+  }
+
+  // ChatGPT Web may rotate the NextAuth session-token during the validation
+  // request. Persist the fresh cookie in the same storage shape that the
+  // executor reads, so a nightly validation can repair a rotated credential
+  // without requiring a manual paste. A fully expired/revoked session still
+  // returns no replacement and remains a re-authentication case.
+  if (typeof result.refreshedCookie === "string" && result.refreshedCookie.trim()) {
+    const currentProviderSpecificData =
+      connection.providerSpecificData && typeof connection.providerSpecificData === "object"
+        ? connection.providerSpecificData
+        : {};
+    const hasApiKeyStorage =
+      typeof connection.apiKey === "string" && connection.apiKey.trim().length > 0;
+    const usesCookieStorage =
+      connection.authType === "cookie" || "cookie" in currentProviderSpecificData;
+
+    if (usesCookieStorage) {
+      const currentUpdateData =
+        updateData.providerSpecificData && typeof updateData.providerSpecificData === "object"
+          ? updateData.providerSpecificData
+          : currentProviderSpecificData;
+      updateData.providerSpecificData = {
+        ...currentUpdateData,
+        cookie: result.refreshedCookie,
+      };
+    }
+    if (hasApiKeyStorage || !usesCookieStorage) {
+      updateData.apiKey = result.refreshedCookie;
     }
   }
 
