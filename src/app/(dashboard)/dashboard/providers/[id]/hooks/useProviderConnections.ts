@@ -99,7 +99,7 @@ export interface UseProviderConnectionsReturn {
     connectionId: string,
     perKeyProxyEnabled: boolean
   ) => Promise<void>;
-  handleRetestConnection: (connectionId: string) => Promise<void>;
+  handleRetestConnection: (connectionId: string, mode?: "auth" | "completion") => Promise<void>;
   handleRefreshToken: (connectionId: string) => Promise<void>;
   handleSwapPriority: (conn1: any, conn2: any) => Promise<void>;
   handleReorderByAvailability: () => Promise<void>;
@@ -533,15 +533,42 @@ export function useProviderConnections(
     }
   };
 
-  const handleRetestConnection = async (connectionId: string) => {
+  const handleRetestConnection = async (
+    connectionId: string,
+    mode: "auth" | "completion" = "auth"
+  ) => {
     if (!connectionId || retestingId) return;
     setRetestingId(connectionId);
     try {
-      const res = await fetch(`/api/providers/${connectionId}/test`, { method: "POST" });
+      const res = await fetch(`/api/providers/${connectionId}/test`, {
+        method: "POST",
+        ...(mode === "completion"
+          ? {
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ mode: "completion" }),
+            }
+          : {}),
+      });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         notify.error(data.error || t("failedRetestConnection"));
         return;
+      }
+      if (mode === "completion") {
+        const data = await res.json().catch(() => ({}) as any);
+        const liveTestPassed =
+          typeof t.has === "function" && t.has("liveTestPassed")
+            ? t("liveTestPassed")
+            : "Live test passed";
+        const liveTestFailed =
+          typeof t.has === "function" && t.has("liveTestFailed")
+            ? t("liveTestFailed")
+            : "Live test failed";
+        if (data.valid) {
+          notify.success(`${liveTestPassed} · ${data.latencyMs}ms`);
+        } else {
+          notify.error(data.error || liveTestFailed);
+        }
       }
       await fetchConnections();
     } catch (error) {

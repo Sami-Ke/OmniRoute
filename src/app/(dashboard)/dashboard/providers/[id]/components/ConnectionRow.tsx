@@ -15,11 +15,7 @@ import {
   getCodexEffectiveServiceTier,
   type CodexGlobalServiceMode,
 } from "@/lib/providers/codexFastTier";
-import {
-  normalizeCodexLimitPolicy,
-  providerText,
-  ERROR_TYPE_LABELS,
-} from "../providerPageHelpers";
+import { normalizeCodexLimitPolicy, providerText, ERROR_TYPE_LABELS } from "../providerPageHelpers";
 import { getCodexPlanLabel } from "../codexPlanLabel";
 import ProviderQuotaVisibilityToggle from "./ProviderQuotaVisibilityToggle";
 
@@ -75,6 +71,7 @@ export interface ConnectionRowProps {
   cliproxyapiEnabled?: boolean;
   onToggleCliproxyapiMode?: (enabled?: boolean) => void;
   onRetest: () => void;
+  onLiveTest?: () => void;
   isRetesting?: boolean;
   onEdit: () => void;
   onDelete: () => void;
@@ -358,6 +355,7 @@ export default function ConnectionRow({
   onToggleCodexWeekly,
   onToggleCliproxyapiMode,
   onRetest,
+  onLiveTest,
   isRetesting,
   onEdit,
   onDelete,
@@ -806,6 +804,24 @@ export default function ConnectionRow({
         >
           {t("retest")}
         </Button>
+        {onLiveTest && (
+          <Button
+            size="sm"
+            variant="ghost"
+            icon="bolt"
+            loading={isRetesting}
+            disabled={connection.isActive === false || isRetesting}
+            onClick={onLiveTest}
+            className="!h-7 !px-2 text-xs"
+            title={
+              typeof t.has === "function" && t.has("liveTestTitle")
+                ? t("liveTestTitle")
+                : "Send one real completion through this connection"
+            }
+          >
+            {typeof t.has === "function" && t.has("liveTest") ? t("liveTest") : "Live test"}
+          </Button>
+        )}
         {/* T12: Manual token refresh for OAuth accounts */}
         {onRefreshToken && (
           <Button
