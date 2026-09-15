@@ -122,7 +122,7 @@ export const WEB_COOKIE_PROVIDERS = {
     textIcon: "CP",
     website: "https://copilot.microsoft.com",
     authHint:
-      "Paste the access_token from copilot.microsoft.com DevTools → Network. Do not paste the full Cookie header.",
+      "Sign in at copilot.microsoft.com, then use the authenticated /c/api request in DevTools → Network and copy its Authorization: Bearer value (without 'Bearer'). Do not paste the full Cookie header.",
     subscriptionRisk: true,
     riskNoticeVariant: "webCookie",
   },

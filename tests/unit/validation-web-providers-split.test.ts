@@ -7,6 +7,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { __setBrowserGrokChatOverrideForTesting } from "../../open-sse/services/browserGrokChat.ts";
+
 const A = await import("../../src/lib/providers/validation/webProvidersA.ts");
 const B = await import("../../src/lib/providers/validation/webProvidersB.ts");
 const meta = await import("../../src/lib/providers/validation/metaAi.ts");
@@ -58,4 +60,39 @@ test("metaAi.buildMetaAiValidationBody emits a persisted-query body with fresh U
 test("host dispatcher surface remains intact after the move", () => {
   assert.equal(typeof (HOST as Record<string, unknown>).validateProviderApiKey, "function");
   assert.equal(typeof (HOST as Record<string, unknown>).validateWebCookieProvider, "function");
+});
+
+test("Grok validation uses the browser transport when it is enabled", async () => {
+  const previous = process.env.OMNIROUTE_GROK_BROWSER_TRANSPORT;
+  process.env.OMNIROUTE_GROK_BROWSER_TRANSPORT = "1";
+  __setBrowserGrokChatOverrideForTesting(async (request) => {
+    assert.equal(request.userAgent, "Mozilla/5.0 test-browser");
+    return {
+      status: 200,
+      contentType: "application/x-ndjson",
+      body: Buffer.from('{"result":{"response":{"token":"OK"}}}\n'),
+      isStealth: false,
+      timing: {
+        acquireContextMs: 0,
+        navigateMs: 0,
+        submitMs: 0,
+        captureResponseMs: 0,
+        totalMs: 0,
+      },
+    };
+  });
+
+  try {
+    const result = await A.validateGrokWebProvider({
+      apiKey: "sso=test; sso-rw=test-rw",
+      providerSpecificData: { customUserAgent: "Mozilla/5.0 test-browser" },
+    });
+    assert.equal(result.valid, true);
+    assert.equal(result.error, null);
+    assert.match(result.warning || "", /browser-owned Grok WebSocket/);
+  } finally {
+    __setBrowserGrokChatOverrideForTesting(null);
+    if (previous === undefined) delete process.env.OMNIROUTE_GROK_BROWSER_TRANSPORT;
+    else process.env.OMNIROUTE_GROK_BROWSER_TRANSPORT = previous;
+  }
 });

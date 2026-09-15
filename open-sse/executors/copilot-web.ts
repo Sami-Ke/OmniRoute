@@ -18,6 +18,13 @@ import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import {
+  mergeCitationResults,
+  normalizeCitationsFromResponse,
+  normalizeContent,
+  type CitationNormalizationMetadata,
+  type NormalizedCitation,
+} from "../translator/citationNormalizer.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -169,6 +176,23 @@ export function extractAccessToken(credential: string): string | null {
   if (!credential) return null;
   const value = credential.trim();
   if (!value) return null;
+  // The login API persists extracted fields as a JSON object in api_key and
+  // provider_specific_data. Unwrap the supported token fields before parsing
+  // cookie/header forms so an auto-captured Copilot credential is usable by
+  // the executor without exposing the raw value in logs.
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const key of ["access_token", "accessToken", "token"]) {
+        const candidate = parsed[key];
+        if (typeof candidate === "string" && candidate.trim()) {
+          return extractAccessToken(candidate);
+        }
+      }
+    }
+  } catch {
+    // Not a JSON credential wrapper; continue with the supported text forms.
+  }
   // Parse wrappers before accepting a long value as a direct token. Full
   // Cookie/Authorization strings are often longer than a JWT itself.
   const match = value.match(/(?:^|[;\s])access_token=([^;\s]+)/i);
@@ -202,6 +226,100 @@ export function extractAccessToken(credential: string): string | null {
  */
 export function sessionPoolKey(token?: string): string {
   return token && token.length > 0 ? token : "anonymous";
+}
+
+export type CopilotCollectedResponse = {
+  content: string;
+  reasoningContent: string;
+  annotations: NormalizedCitation[];
+  citationMetadata: CitationNormalizationMetadata;
+  images: unknown[];
+};
+
+/**
+ * Collect the OpenAI-compatible SSE emitted by wsChat into the exact same
+ * answer/citation representation returned by the non-streaming endpoint.
+ *
+ * The buffer is intentional: a ReadableStream chunk boundary may occur in the
+ * middle of an SSE line, so decoding each chunk with split("\n") can silently
+ * drop text or citations.
+ */
+export async function collectCopilotSseResponse(
+  stream: ReadableStream<Uint8Array>
+): Promise<CopilotCollectedResponse> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let reasoningContent = "";
+  const images: unknown[] = [];
+  let citations = normalizeCitationsFromResponse({});
+
+  const consumeLine = (rawLine: string): void => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+
+    try {
+      const parsed = JSON.parse(data) as Record<string, unknown>;
+      const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+      const firstChoice =
+        choices[0] && typeof choices[0] === "object"
+          ? (choices[0] as Record<string, unknown>)
+          : null;
+      const delta =
+        firstChoice?.delta && typeof firstChoice.delta === "object"
+          ? (firstChoice.delta as Record<string, unknown>)
+          : null;
+      if (!delta) return;
+
+      content += normalizeContent(delta.content);
+      if (typeof delta.reasoning_content === "string") {
+        reasoningContent += delta.reasoning_content;
+      }
+      if (Array.isArray(delta.content)) {
+        for (const part of delta.content) {
+          if (
+            part &&
+            typeof part === "object" &&
+            (part as Record<string, unknown>).type === "image_url"
+          ) {
+            images.push(part);
+          }
+        }
+      }
+
+      citations = mergeCitationResults(citations, normalizeCitationsFromResponse(delta));
+    } catch {
+      // wsChat emits one JSON object per data line. Malformed upstream events
+      // remain non-fatal, matching the streaming path's behavior.
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      consumeLine(buffer.slice(0, newlineIndex));
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf("\n");
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim()) consumeLine(buffer);
+
+  return {
+    content,
+    reasoningContent,
+    annotations: citations.annotations,
+    citationMetadata: citations.metadata,
+    images,
+  };
 }
 
 // ─── Session Management ─────────────────────────────────────────────────────
@@ -630,12 +748,16 @@ export class CopilotWebExecutor extends BaseExecutor {
     const model = inputModel || (body?.model as string) || "copilot";
     const mode = getCopilotMode(model);
     const stream = inputStream !== false; // Default to streaming
+    const providerSpecificData = credentials?.providerSpecificData || {};
 
     // Extract access token from credentials
     const rawCred =
-      credentials?.apiKey || (credentials?.providerSpecificData?.cookie as string) || "";
+      credentials?.apiKey ||
+      (typeof providerSpecificData.access_token === "string" ? providerSpecificData.access_token : "") ||
+      (typeof providerSpecificData.accessToken === "string" ? providerSpecificData.accessToken : "") ||
+      (typeof providerSpecificData.token === "string" ? providerSpecificData.token : "") ||
+      (typeof providerSpecificData.cookie === "string" ? providerSpecificData.cookie : "");
     const accessToken = extractAccessToken(rawCred);
-    const providerSpecificData = credentials?.providerSpecificData || {};
 
     // Extract prompt from messages
     const messages = (body?.messages as Array<Record<string, unknown>>) || [];
@@ -700,29 +822,16 @@ export class CopilotWebExecutor extends BaseExecutor {
           providerSpecificData,
           sessionCookies
         );
-        const reader = wsStream.getReader();
-        const decoder = new TextDecoder();
-        let fullText = "";
-        let reasoningText = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const lines = decoder.decode(value, { stream: true }).split("\n");
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const data = line.slice(6).trim();
-            if (data === "[DONE]") continue;
-            try {
-              const parsed = JSON.parse(data);
-              const delta = parsed.choices?.[0]?.delta;
-              if (delta?.content) fullText += delta.content;
-              if (delta?.reasoning_content) reasoningText += delta.reasoning_content;
-            } catch {
-              /* skip */
-            }
-          }
+        const collected = await collectCopilotSseResponse(wsStream);
+        const message: Record<string, unknown> = {
+          role: "assistant",
+          content: collected.content,
+          annotations: collected.annotations,
+        };
+        if (collected.reasoningContent) {
+          message.reasoning_content = collected.reasoningContent;
         }
+        if (collected.images.length > 0) message.images = collected.images;
 
         const result = {
           id: `chatcmpl-copilot-${Date.now()}`,
@@ -732,11 +841,12 @@ export class CopilotWebExecutor extends BaseExecutor {
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: fullText || "(empty response)" },
+              message,
               finish_reason: "stop",
             },
           ],
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          omniroute: { citations: collected.citationMetadata },
         };
 
         return {

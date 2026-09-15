@@ -37,6 +37,17 @@ export function shouldUseGrokBrowserBacked(): boolean {
   return poolFlag === "on" || poolFlag === "1" || poolFlag === "true";
 }
 
+/**
+ * Opt-in to keeping the actual Grok chat turn inside Chromium. This is a
+ * separate gate from the older clearance-refresh fallback: the current Grok
+ * client uses a page WebSocket, so refreshing cf_clearance and replaying the
+ * legacy HTTP endpoint is not an equivalent transport.
+ */
+export function shouldUseGrokBrowserTransport(): boolean {
+  const flag = process.env.OMNIROUTE_GROK_BROWSER_TRANSPORT;
+  return flag === "1" || flag === "true" || flag === "on";
+}
+
 type AcquireGrokClearanceFn = (signal?: AbortSignal | null) => Promise<string | null>;
 
 // Test-only injection point — mirrors browserBackedChat.ts's

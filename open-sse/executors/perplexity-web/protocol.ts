@@ -156,6 +156,8 @@ export interface PplxStreamEvent {
   blocks?: PplxBlock[];
   backend_uuid?: string;
   web_results?: Array<{ url?: string; name?: string }>;
+  citations?: Array<{ url?: string; title?: string; name?: string }>;
+  search_results?: Array<{ url?: string; title?: string; name?: string }>;
   error_code?: string;
   error_message?: string;
   display_model?: string;
@@ -356,6 +358,7 @@ export function buildQuery(parsed: ParsedMessages, followUpUuid: string | null):
 export interface ContentChunk {
   delta?: string;
   answer?: string;
+  citations?: Array<{ url?: string; title?: string }>;
   backendUuid?: string;
   thinking?: string;
   error?: string;
@@ -587,6 +590,7 @@ export async function* extractContent(
   let primaryUsage: string | null = null;
   let lastEventText: string | undefined;
   let lastUpsell: PplxUpsellInformation | undefined;
+  const seenCitationUrls = new Set<string>();
 
   for await (const event of readPplxSseEvents(eventStream, signal)) {
     if (event.error_code || event.error_message) {
@@ -600,6 +604,25 @@ export async function* extractContent(
     if (event.backend_uuid) backendUuid = event.backend_uuid;
     if (event.text) lastEventText = event.text;
     if (event.upsell_information) lastUpsell = event.upsell_information;
+
+    const eventCitations: Array<{ url?: string; title?: string }> = [];
+    const addEventCitation = (
+      value: { url?: string; name?: string; title?: string } | undefined
+    ) => {
+      const url = typeof value?.url === "string" ? value.url : "";
+      if (!url || seenCitationUrls.has(url)) return;
+      seenCitationUrls.add(url);
+      eventCitations.push({ url, title: value?.title ?? value?.name });
+    };
+    for (const result of event.web_results ?? []) addEventCitation(result);
+    for (const result of event.citations ?? []) addEventCitation(result);
+    for (const result of event.search_results ?? []) addEventCitation(result);
+    for (const block of event.blocks ?? []) {
+      for (const result of block.web_result_block?.web_results ?? []) addEventCitation(result);
+    }
+    if (eventCitations.length > 0) {
+      yield { citations: eventCitations, backendUuid: backendUuid ?? undefined };
+    }
 
     const blocks = event.blocks ?? [];
     for (const block of blocks) {

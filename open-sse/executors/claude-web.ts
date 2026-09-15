@@ -21,6 +21,7 @@ import {
 } from "./base.ts";
 import {
   applyClaudeWebBrowserTemplate,
+  applyClaudeWebDirectToolFallback,
   sendClaudeWebBrowser,
   type ClaudeWebTransportRequest,
   type ClaudeWebTransportResult,
@@ -449,7 +450,9 @@ export class ClaudeWebExecutor extends BaseExecutor {
       if (forceBrowserTransport()) {
         transportResult = await this.sendBrowser(transportRequest);
       } else {
-        const directRequest = applyClaudeWebBrowserTemplate(transportRequest);
+        const directRequest = applyClaudeWebDirectToolFallback(
+          applyClaudeWebBrowserTemplate(transportRequest)
+        );
         transportResult = await this.sendDirect(directRequest);
         if (isClaudeWebChallenge(transportResult) && browserFallbackEnabled()) {
           transportResult = await this.sendBrowser(directRequest);
@@ -478,14 +481,20 @@ export class ClaudeWebExecutor extends BaseExecutor {
         model,
         stream,
         responseMetadata: turn.responseMetadata,
+        provenance: {
+          upstream_provider: "claude-web",
+          upstream_model: model,
+          fallback_used: false,
+        },
         onComplete: ({ assistantText }) => commitClaudeWebTurn(turn, assistantText),
         onFailure: () => invalidateClaudeWebTurn(turn),
         log,
       });
       return makeExecutionResult(response, auditBody, auditUrl, auditHeaders);
-    } catch {
+    } catch (error) {
       invalidateClaudeWebTurn(turn);
-      log?.error?.("CLAUDE-WEB", "Transport failed");
+      const transportError = sanitizeErrorMessage(error) || "unknown error";
+      log?.error?.("CLAUDE-WEB", `Transport failed: ${transportError}`);
       return makeExecutionResult(
         makeErrorResponse(502, "Claude Web connection failed"),
         auditBody,

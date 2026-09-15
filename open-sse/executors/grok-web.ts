@@ -19,6 +19,7 @@ import {
   type ExecuteInput,
   type ExecutorLog,
 } from "./base.ts";
+import { getCustomUserAgent } from "./base/headers.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { buildGrokCookieHeader } from "@/lib/providers/webCookieAuth";
 import {
@@ -30,8 +31,10 @@ import {
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import {
   shouldUseGrokBrowserBacked,
+  shouldUseGrokBrowserTransport,
   acquireFreshGrokClearance,
 } from "../services/grokClearance.ts";
+import { browserGrokChat } from "../services/browserGrokChat.ts";
 import type { GrokStreamEvent } from "./grok-web/types.ts";
 import {
   type OpenAIToolCall,
@@ -48,12 +51,34 @@ import {
   cleanGrokThinkingText,
   extractStructuredReasoning,
 } from "./grok-web/text-cleanup.ts";
+import {
+  mergeCitationResults,
+  normalizeCitationCandidates,
+  type CitationNormalizationResult,
+} from "../translator/citationNormalizer.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const GROK_CHAT_API = "https://grok.com/rest/app-chat/conversations/new";
 const GROK_USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+
+function resolveGrokCredential(credentials: ExecuteInput["credentials"]): string {
+  if (typeof credentials.apiKey === "string" && credentials.apiKey.trim()) {
+    return credentials.apiKey;
+  }
+  const cookie = credentials.providerSpecificData?.cookie;
+  return typeof cookie === "string" ? cookie : "";
+}
+
+function bufferToReadableStream(buffer: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(buffer);
+      controller.close();
+    },
+  });
+}
 
 // ─── Model mappings ─────────────────────────────────────────────────────────
 // Grok Web exposes UI modes, not stable public model IDs. Keep OmniRoute model
@@ -161,6 +186,7 @@ async function* readGrokNdjsonEvents(
 
 interface ContentChunk {
   delta?: string;
+  citations?: Array<{ url?: string; title?: string }>;
   thinking?: string;
   toolCalls?: OpenAIToolCall[];
   fingerprint?: string;
@@ -183,6 +209,7 @@ async function* extractContent(
   const thinkingFilter = new GrokMarkupFilter();
   let emittedThinking = "";
   let emittedVisibleContent = false;
+  const seenCitationUrls = new Set<string>();
 
   for await (const event of readGrokNdjsonEvents(eventStream, signal)) {
     // Error handling
@@ -193,6 +220,21 @@ async function* extractContent(
 
     const resp = event.result?.response;
     if (!resp) continue;
+
+    const webResults = resp.webSearchResults?.results ?? [];
+    const citationItems: Array<{ url?: string; title?: string }> = [];
+    for (const result of webResults) {
+      const normalized = normalizeCitationCandidates([result], "$.grok.webSearchResults");
+      for (const annotation of normalized.annotations) {
+        const url = annotation.url_citation.url;
+        if (seenCitationUrls.has(url)) continue;
+        seenCitationUrls.add(url);
+        citationItems.push({ url, title: annotation.url_citation.title });
+      }
+    }
+    if (citationItems.length > 0) {
+      yield { citations: citationItems, fingerprint, responseId };
+    }
 
     // Extract metadata
     if (resp.llmInfo?.modelHash && !fingerprint) {
@@ -372,6 +414,7 @@ function buildStreamingResponse(
 
           let fp = "";
           let buffered = "";
+          let citationResult: CitationNormalizationResult = normalizeCitationCandidates([]);
 
           for await (const chunk of extractContent(
             eventStream,
@@ -381,6 +424,34 @@ function buildStreamingResponse(
             true
           )) {
             if (chunk.fingerprint) fp = chunk.fingerprint;
+
+            if (chunk.citations) {
+              const next = normalizeCitationCandidates(chunk.citations, "$.grok.webSearchResults");
+              const previousCount = citationResult.annotations.length;
+              citationResult = mergeCitationResults(citationResult, next);
+              const newAnnotations = citationResult.annotations.slice(previousCount);
+              if (newAnnotations.length > 0) {
+                controller.enqueue(
+                  encoder.encode(
+                    sseChunk({
+                      id: cid,
+                      object: "chat.completion.chunk",
+                      created,
+                      model,
+                      system_fingerprint: fp || null,
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { annotations: newAnnotations },
+                          finish_reason: null,
+                          logprobs: null,
+                        },
+                      ],
+                    })
+                  )
+                );
+              }
+            }
 
             if (chunk.error) {
               controller.enqueue(
@@ -553,9 +624,16 @@ async function buildNonStreamingResponse(
   let fullContent = "";
   let fingerprint = "";
   const thinkingParts: string[] = [];
+  let citationResult: CitationNormalizationResult = normalizeCitationCandidates([]);
 
   for await (const chunk of extractContent(eventStream, isThinkingModel, toolRegistry, signal)) {
     if (chunk.fingerprint) fingerprint = chunk.fingerprint;
+    if (chunk.citations) {
+      citationResult = mergeCitationResults(
+        citationResult,
+        normalizeCitationCandidates(chunk.citations, "$.grok.webSearchResults")
+      );
+    }
 
     if (chunk.error) {
       return new Response(
@@ -580,7 +658,12 @@ async function buildNonStreamingResponse(
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: null, tool_calls: chunk.toolCalls },
+              message: {
+                role: "assistant",
+                content: "",
+                annotations: citationResult.annotations,
+                tool_calls: chunk.toolCalls,
+              },
               finish_reason: "tool_calls",
               logprobs: null,
             },
@@ -610,7 +693,12 @@ async function buildNonStreamingResponse(
         choices: [
           {
             index: 0,
-            message: { role: "assistant", content: null, tool_calls: manifestToolCalls },
+            message: {
+              role: "assistant",
+              content: "",
+              annotations: citationResult.annotations,
+              tool_calls: manifestToolCalls,
+            },
             finish_reason: "tool_calls",
             logprobs: null,
           },
@@ -622,6 +710,7 @@ async function buildNonStreamingResponse(
   }
 
   const msg: Record<string, unknown> = { role: "assistant", content: fullContent };
+  msg.annotations = citationResult.annotations;
   if (thinkingParts.length > 0) {
     msg.reasoning_content = thinkingParts.join("\n");
   }
@@ -860,6 +949,17 @@ export class GrokWebExecutor extends BaseExecutor {
       return { response: errResp, url: GROK_CHAT_API, headers: {}, transformedBody: body };
     }
 
+    const grokCredential = resolveGrokCredential(credentials);
+    if (!grokCredential.trim()) {
+      const errResp = new Response(
+        JSON.stringify({
+          error: { message: "Missing Grok sso cookie", type: "authentication_error" },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+      return { response: errResp, url: GROK_CHAT_API, headers: {}, transformedBody: body };
+    }
+
     // Build Grok request payload
     const grokPayload: Record<string, unknown> = {
       temporary: true,
@@ -923,8 +1023,8 @@ export class GrokWebExecutor extends BaseExecutor {
     // Cookie auth — accepts a bare value, "sso=<value>", or a full DevTools
     // cookie blob. Forwards both `sso` and (when present) the paired `sso-rw`
     // write cookie, which Grok's anti-bot now requires (#3063).
-    if (credentials.apiKey) {
-      const cookieHeader = buildGrokCookieHeader(credentials.apiKey);
+    if (grokCredential) {
+      const cookieHeader = buildGrokCookieHeader(grokCredential);
       if (cookieHeader) headers["Cookie"] = cookieHeader;
     }
 
@@ -943,15 +1043,45 @@ export class GrokWebExecutor extends BaseExecutor {
     // to send a Chrome-like handshake instead.
     let tlsResult: TlsFetchResult;
     try {
-      tlsResult = await tlsFetchGrok(GROK_CHAT_API, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(grokPayload),
-        timeoutMs: FETCH_TIMEOUT_MS,
-        signal: combinedSignal,
-        stream: true,
-        streamEofSymbol: "[DONE]",
-      });
+      if (shouldUseGrokBrowserTransport() && !toolRegistry.enabled) {
+        log?.info?.(
+          "GROK-WEB",
+          "Using browser-owned Grok WebSocket transport (explicit opt-in)"
+        );
+        const browserResult = await browserGrokChat({
+          cookieString: grokCredential,
+          userMessage: message,
+          userAgent: getCustomUserAgent(credentials.providerSpecificData),
+          signal: combinedSignal,
+        });
+        if (browserResult.status >= 400) {
+          const errResp = new Response(browserResult.body.toString("utf8"), {
+            status: browserResult.status,
+            headers: { "Content-Type": browserResult.contentType },
+          });
+          return { response: errResp, url: GROK_CHAT_API, headers, transformedBody: grokPayload };
+        }
+        tlsResult = {
+          status: browserResult.status,
+          headers: new Headers({ "Content-Type": browserResult.contentType }),
+          text: null,
+          body: bufferToReadableStream(browserResult.body),
+        };
+      } else {
+        // Fetch from Grok via TLS-impersonating client (#3180).
+        // Grok sits behind Cloudflare Enterprise which rejects Node's native TLS
+        // fingerprint even with valid sso+sso-rw cookies. We use tls-client-node
+        // to send a Chrome-like handshake instead.
+        tlsResult = await tlsFetchGrok(GROK_CHAT_API, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(grokPayload),
+          timeoutMs: FETCH_TIMEOUT_MS,
+          signal: combinedSignal,
+          stream: true,
+          streamEofSymbol: "[DONE]",
+        });
+      }
     } catch (err) {
       if (err instanceof TlsClientUnavailableError) {
         log?.error?.("GROK-WEB", `TLS client unavailable: ${err.message}`);

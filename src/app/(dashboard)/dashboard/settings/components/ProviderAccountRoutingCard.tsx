@@ -84,7 +84,7 @@ function useProviderAccountRoutingState(providerKey: string) {
         setBusy(false);
       }
     },
-    [providerKey]
+    [providerKey, load]
   );
 
   return { strategy, setStrategy, stickyLimit, setStickyLimit, busy, save };

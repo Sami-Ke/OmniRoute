@@ -7,9 +7,8 @@ import assert from "node:assert/strict";
 // showed "active" for a connection that could not serve a single request. The
 // probe sends one real non-streaming completion pinned to the connection so the
 // recorded status reflects live-traffic behavior.
-const { runCompletionProbe } = await import(
-  "../../src/app/api/providers/[id]/test/completionProbe.ts"
-);
+const { runCompletionProbe } =
+  await import("../../src/app/api/providers/[id]/test/completionProbe.ts");
 
 const CONNECTION = {
   id: "conn-1",
@@ -18,6 +17,29 @@ const CONNECTION = {
 };
 
 const okCredentials = async () => ({ apiKey: "cookie", connectionId: "conn-1" });
+
+test("completion probe: ChatGPT registry fallback supplies gpt-5.5", async () => {
+  let seenModel: string | null = null;
+  const result = await runCompletionProbe(
+    { id: "chatgpt-no-model", provider: "chatgpt-web" },
+    null,
+    {
+      getCredentials: async (_provider, _connectionId, model) => {
+        seenModel = model;
+        return { apiKey: "cookie", connectionId: "chatgpt-no-model" };
+      },
+      runChat: async () =>
+        new Response(
+          JSON.stringify({ choices: [{ message: { role: "assistant", content: "OK" } }] }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        ),
+    }
+  );
+
+  assert.equal(result.valid, true);
+  assert.equal(result.model, "gpt-5.5");
+  assert.equal(seenModel, "gpt-5.5");
+});
 
 test("completion probe: HTTP 200 with content → valid, content surfaced", async () => {
   const seen: Record<string, unknown> & { chatOptions?: Record<string, unknown> } = {};
@@ -80,12 +102,16 @@ test("completion probe: {success, response} envelope from handleChatCore is unwr
 });
 
 test("completion probe: no resolvable model → invalid with actionable error", async () => {
-  const result = await runCompletionProbe({ id: "c", provider: "chatgpt-web" }, null, {
-    getCredentials: okCredentials,
-    runChat: async () => {
-      throw new Error("must not be called");
-    },
-  });
+  const result = await runCompletionProbe(
+    { id: "c", provider: "provider-without-a-default" },
+    null,
+    {
+      getCredentials: okCredentials,
+      runChat: async () => {
+        throw new Error("must not be called");
+      },
+    }
+  );
 
   assert.equal(result.valid, false);
   assert.match(result.error, /completionModel|default model/);

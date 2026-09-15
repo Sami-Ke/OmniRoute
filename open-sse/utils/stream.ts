@@ -61,6 +61,14 @@ import {
   getUnsupportedReasoningValue,
   hasUnsupportedReasoningSignal,
 } from "./reasoningFields.ts";
+import {
+  attachResponseProvenance,
+  mergeCitationResults,
+  normalizeCitationCandidates,
+  normalizeOpenAICompatibleChunk,
+  type CitationNormalizationResult,
+  type ResponseProvenance,
+} from "../translator/citationNormalizer.ts";
 
 /**
  * Race a response body read against a timeout.
@@ -143,6 +151,7 @@ type StreamOptions = {
   body?: unknown;
   onComplete?: ((payload: StreamCompletePayload) => void) | null;
   onFailure?: ((payload: StreamFailurePayload) => boolean | void | Promise<void>) | null;
+  responseProvenance?: ResponseProvenance | null;
   /**
    * Request-scoped `{namespace, name}` ledger for Responses namespace child
    * tools that were flattened to a bare leaf on the Chat wire (#7936
@@ -681,6 +690,7 @@ export function createSSEStream(options: StreamOptions = {}) {
     body = null,
     onComplete = null,
     onFailure = null,
+    responseProvenance = null,
     dropResponsesCommentary,
     customToolNames = new Set<string>(),
     requestToolIdentityMap = null,
@@ -733,6 +743,9 @@ export function createSSEStream(options: StreamOptions = {}) {
   // (response.completed / message_stop respectively).
   const shouldEmitDoneTerminator = !clientExpectsResponsesStream && !clientExpectsClaudeStream;
 
+  const isOpenAIClientStream =
+    (mode === STREAM_MODE.PASSTHROUGH ? clientResponseFormat : sourceFormat) === FORMATS.OPENAI;
+
   let buffer = "";
   let usage: UsageTokenRecord | null = null;
   /** Passthrough (OpenAI CC shape): saw tool_calls in stream before finish_reason */
@@ -742,6 +755,7 @@ export function createSSEStream(options: StreamOptions = {}) {
   /** Passthrough: accumulate tool_calls deltas for call log responseBody */
   const passthroughToolCalls = new Map<string, ToolCall>();
   let passthroughToolCallSeq = 0;
+  let streamCitations: CitationNormalizationResult = normalizeCitationCandidates([]);
   const allowedToolNames = extractAllowedToolNames(body);
   let skipPassthroughEvent = false;
 
@@ -994,6 +1008,11 @@ export function createSSEStream(options: StreamOptions = {}) {
     let itemSanitized: Record<string, unknown> = item;
     const isResponsesEvent = typeof item?.event === "string" && item.event.startsWith("response.");
     if (sourceFormat === FORMATS.OPENAI && !isResponsesEvent) {
+      const normalizedChunk = normalizeOpenAICompatibleChunk(itemSanitized);
+      itemSanitized = normalizedChunk.chunk as Record<string, unknown>;
+      streamCitations = mergeCitationResults(streamCitations, normalizedChunk.citations);
+    }
+    if (sourceFormat === FORMATS.OPENAI && !isResponsesEvent) {
       itemSanitized = sanitizeStreamingChunk(itemSanitized) as Record<string, unknown>;
     }
 
@@ -1003,6 +1022,18 @@ export function createSSEStream(options: StreamOptions = {}) {
 
     const isFinishChunk =
       itemSanitized.type === "message_delta" || itemSanitized.choices?.[0]?.finish_reason;
+    if (isOpenAIClientStream && isFinishChunk) {
+      itemSanitized = attachResponseProvenance(
+        {
+          ...itemSanitized,
+          omniroute: {
+            ...asRecord(itemSanitized.omniroute),
+            citations: streamCitations.metadata,
+          },
+        },
+        responseProvenance ?? {}
+      ) as Record<string, unknown>;
+    }
     if (
       state?.finishReason &&
       isFinishChunk &&
@@ -1708,6 +1739,12 @@ export function createSSEStream(options: StreamOptions = {}) {
                   const rawDelta = parsed.choices?.[0]?.delta;
                   const hadReasoningAlias = hasUnsupportedReasoningSignal(rawDelta);
 
+                  const normalizedChunk = normalizeOpenAICompatibleChunk(parsed);
+                  parsed = normalizedChunk.chunk as typeof parsed;
+                  streamCitations = mergeCitationResults(
+                    streamCitations,
+                    normalizedChunk.citations
+                  );
                   parsed = sanitizeStreamingChunk(parsed);
                   if (
                     parsed &&
@@ -1768,6 +1805,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                   const needsReserialization =
                     splitMixedReasoningContent ||
                     hadReasoningAlias ||
+                    normalizedChunk.changed ||
                     (delta?.content === "" && delta?.reasoning_content);
 
                   // T18: Track if we saw tool calls & accumulate for call log
@@ -1906,6 +1944,21 @@ export function createSSEStream(options: StreamOptions = {}) {
                     hadNonStringToolCallId ||
                     hadNonStringTopLevelId
                   ) {
+                    output = `data: ${JSON.stringify(parsed)}\n\n`;
+                    injectedUsage = true;
+                  }
+
+                  if (isOpenAIClientStream && isFinishChunk) {
+                    parsed = attachResponseProvenance(
+                      {
+                        ...parsed,
+                        omniroute: {
+                          ...asRecord(parsed.omniroute),
+                          citations: streamCitations.metadata,
+                        },
+                      },
+                      responseProvenance ?? {}
+                    ) as typeof parsed;
                     output = `data: ${JSON.stringify(parsed)}\n\n`;
                     injectedUsage = true;
                   }
@@ -2409,19 +2462,23 @@ export function createSSEStream(options: StreamOptions = {}) {
               // (pi CLI) reject the stream with "Stream ended without finish_reason".
               // Synthesize a terminal chunk when the upstream omitted one.
               if (shouldEmitDoneTerminator && !passthroughSawFinishReason) {
-                const syntheticFinishChunk = {
-                  id: passthroughResponsesId || `chatcmpl-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: model || "unknown",
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {},
-                      finish_reason: passthroughHasToolCalls ? "tool_calls" : "stop",
-                    },
-                  ],
-                };
+                const syntheticFinishChunk = attachResponseProvenance(
+                  {
+                    id: passthroughResponsesId || `chatcmpl-${Date.now()}`,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: model || "unknown",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason: passthroughHasToolCalls ? "tool_calls" : "stop",
+                      },
+                    ],
+                    omniroute: { citations: streamCitations.metadata },
+                  },
+                  responseProvenance ?? {}
+                );
                 const finishOutput = `data: ${JSON.stringify(syntheticFinishChunk)}\n\n`;
                 reqLogger?.appendConvertedChunk?.(finishOutput);
                 controller.enqueue(encoder.encode(finishOutput));
@@ -2468,7 +2525,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                 }
                 const message: Record<string, unknown> = {
                   role: "assistant",
-                  content: content || null,
+                  content: content || "",
                 };
                 const reasoning = passthroughAccumulatedReasoning.trim();
                 if (reasoning) {
@@ -2479,6 +2536,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                     (a, b) => a.index - b.index
                   );
                 }
+                message.annotations = streamCitations.annotations;
                 // Hardening: log empty assistant response after tool completion
                 // for observability — helps diagnose Copilot "Sorry, no response was returned"
                 if (passthroughHasToolCalls && !content.trim() && !reasoning.trim()) {
@@ -2487,20 +2545,24 @@ export function createSSEStream(options: StreamOptions = {}) {
                   );
                 }
 
-                const responseBody = {
-                  choices: [
-                    {
-                      message,
-                      finish_reason: passthroughHasToolCalls ? "tool_calls" : "stop",
+                const responseBody = attachResponseProvenance(
+                  {
+                    choices: [
+                      {
+                        message,
+                        finish_reason: passthroughHasToolCalls ? "tool_calls" : "stop",
+                      },
+                    ],
+                    usage: {
+                      prompt_tokens: prompt,
+                      completion_tokens: completion,
+                      total_tokens: prompt + completion,
                     },
-                  ],
-                  usage: {
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    total_tokens: prompt + completion,
+                    omniroute: { citations: streamCitations.metadata },
+                    _streamed: true,
                   },
-                  _streamed: true,
-                };
+                  responseProvenance ?? {}
+                );
                 onComplete({
                   status: 200,
                   usage,
@@ -2753,7 +2815,7 @@ export function createSSEStream(options: StreamOptions = {}) {
               const reasoning = (state?.accumulatedReasoning ?? "").trim();
               const message: Record<string, unknown> = {
                 role: "assistant",
-                content: content || null,
+                content: content || "",
               };
               if (reasoning) {
                 message.reasoning_content = reasoning;
@@ -2762,20 +2824,25 @@ export function createSSEStream(options: StreamOptions = {}) {
               if (hasToolCalls) {
                 message.tool_calls = normalizedToolCalls;
               }
-              const responseBody = {
-                choices: [
-                  {
-                    message,
-                    finish_reason: hasToolCalls ? "tool_calls" : "stop",
+              message.annotations = streamCitations.annotations;
+              const responseBody = attachResponseProvenance(
+                {
+                  choices: [
+                    {
+                      message,
+                      finish_reason: hasToolCalls ? "tool_calls" : "stop",
+                    },
+                  ],
+                  usage: {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: prompt + completion,
                   },
-                ],
-                usage: {
-                  prompt_tokens: prompt,
-                  completion_tokens: completion,
-                  total_tokens: prompt + completion,
+                  omniroute: { citations: streamCitations.metadata },
+                  _streamed: true,
                 },
-                _streamed: true,
-              };
+                responseProvenance ?? {}
+              );
               onComplete({
                 status: 200,
                 usage: state?.usage,
@@ -2832,7 +2899,8 @@ export function createSSETransformStreamWithLogger(
   copilotCompatibleReasoning = false,
   suppressThinkClose = false,
   customToolNames: ReadonlySet<string> = new Set(),
-  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null
+  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null,
+  responseProvenance: ResponseProvenance | null = null
 ) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
@@ -2847,6 +2915,7 @@ export function createSSETransformStreamWithLogger(
     body,
     onComplete,
     onFailure,
+    responseProvenance,
     copilotCompatibleReasoning,
     suppressThinkClose,
     customToolNames,
@@ -2865,7 +2934,8 @@ export function createPassthroughStreamWithLogger(
   apiKeyInfo: unknown = null,
   onFailure: ((payload: StreamFailurePayload) => void | Promise<void>) | null = null,
   clientResponseFormat: string | null = null,
-  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null
+  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null,
+  responseProvenance: ResponseProvenance | null = null
 ) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
@@ -2878,6 +2948,7 @@ export function createPassthroughStreamWithLogger(
     body,
     onComplete,
     onFailure,
+    responseProvenance,
     clientResponseFormat,
     requestToolIdentityMap,
   });

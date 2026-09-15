@@ -371,6 +371,7 @@ export function hasValuableContent(chunk: Record<string, unknown>, format: strin
     if (typeof delta.content === "string" && delta.content.length > 0) return true;
     if (hasAnyReasoningSignal(delta)) return true;
     if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
+    if (Array.isArray(delta.annotations) && delta.annotations.length > 0) return true;
     if (firstChoice.finish_reason) return true;
     if (typeof delta.role === "string" && delta.role.length > 0) return true;
     return false;

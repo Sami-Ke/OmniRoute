@@ -5,8 +5,8 @@
  * Follows the pattern from localHealthCheck.ts — runs on a configurable
  * interval with exponential backoff on failure.
  *
- * Reuses the existing testSingleConnection() infrastructure so all 20+
- * provider-specific validators work automatically.
+ * Reuses the existing testSingleConnection() infrastructure so API-key,
+ * Web Session, OAuth, and provider-specific validators share one path.
  *
  * Schedule:
  *   - Initial delay: 30s after server boot (allows DB migrations to complete)
@@ -66,7 +66,6 @@ function getSchedulerState() {
 function isBuildProcess(): boolean {
   return typeof process !== "undefined" && process.env.NEXT_PHASE === "phase-production-build";
 }
-
 
 function isCredentialHealthCheckDisabled(): boolean {
   if (isBuildProcess() || isAutomatedTestProcess()) return true;
@@ -200,7 +199,7 @@ export async function sweep(): Promise<void> {
   state.sweepInProgress = true;
 
   try {
-    // Get all provider connections (API-key + OAuth)
+    // Get all connections with a supported credential-validation path.
     let connections: Array<{
       id: string;
       provider: string;
@@ -210,7 +209,10 @@ export async function sweep(): Promise<void> {
     try {
       const raw = await getProviderConnections({});
       connections = (Array.isArray(raw) ? raw : []).filter(
-        (conn: any) => conn && conn.id && (conn.authType === "apikey" || conn.authType === "oauth")
+        (conn: any) =>
+          conn &&
+          conn.id &&
+          (conn.authType === "apikey" || conn.authType === "cookie" || conn.authType === "oauth")
       ) as Array<{
         id: string;
         provider: string;

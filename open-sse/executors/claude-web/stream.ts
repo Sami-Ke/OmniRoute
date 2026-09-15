@@ -1,5 +1,10 @@
 import { randomUUID } from "crypto";
 
+import {
+  mergeCitationResults,
+  normalizeCitationsFromResponse,
+  type CitationNormalizationResult,
+} from "../../translator/citationNormalizer.ts";
 import { buildErrorBody } from "../../utils/error.ts";
 import type { ExecutorLog } from "../base.ts";
 
@@ -7,17 +12,19 @@ export interface ClaudeWebStreamOptions {
   model: string;
   stream: boolean;
   responseMetadata: Record<string, string>;
+  provenance?: Record<string, unknown>;
   onComplete(result: { assistantText: string; stopReason: string }): void;
   onFailure(): void;
   log?: ExecutorLog | null;
 }
 
 type StreamPhase = "awaiting_message" | "in_message" | "stopped" | "failed";
-type BlockKind = "thinking" | "text" | "other";
+type BlockKind = "thinking" | "text" | "tool" | "other";
 const MAX_CLAUDE_WEB_SSE_PENDING_CHARS = 1024 * 1024;
 type SemanticEvent =
   | { kind: "content"; text: string }
   | { kind: "reasoning"; text: string }
+  | { kind: "citations"; result: CitationNormalizationResult }
   | { kind: "metadata"; eventType: string; data: Record<string, unknown> }
   | { kind: "finish"; stopReason: string };
 
@@ -57,6 +64,18 @@ class ClaudeWebProtocolError extends Error {
     super(message);
     this.name = "ClaudeWebProtocolError";
   }
+}
+
+function safeProtocolLabel(value: unknown): string {
+  if (typeof value !== "string") return "unknown";
+  const normalized = value.slice(0, 80).replace(/[^A-Za-z0-9._:-]/g, "_");
+  return normalized || "unknown";
+}
+
+function protocolDiagnostic(error: unknown): string {
+  const detail =
+    error instanceof ClaudeWebProtocolError ? error.message : "Unexpected stream parser failure";
+  return `Claude Web stream protocol validation failed: ${detail}`;
 }
 
 async function* decodeSseData(
@@ -193,12 +212,44 @@ function thinkingSummaryText(delta: Record<string, unknown>): string {
 interface ProtocolState {
   phase: StreamPhase;
   openBlocks: Map<number, BlockKind>;
+  seenBlocks: Map<number, BlockKind>;
   stopReason: string;
+  recentEvents: string[];
 }
 
 function protocolFailure(state: ProtocolState, message: string): never {
   state.phase = "failed";
-  throw new ClaudeWebProtocolError(message);
+  const trace = state.recentEvents.length > 0 ? `; trace=${state.recentEvents.join(">")}` : "";
+  throw new ClaudeWebProtocolError(`${message}${trace}`);
+}
+
+function recordProtocolEvent(
+  state: ProtocolState,
+  eventType: string,
+  event: Record<string, unknown>
+): void {
+  let detail = safeProtocolLabel(eventType);
+  if (eventType === "content_block_start") {
+    const block =
+      event.content_block && typeof event.content_block === "object"
+        ? (event.content_block as Record<string, unknown>)
+        : null;
+    detail += `:${safeProtocolLabel(block?.type)}`;
+  } else if (eventType === "content_block_delta") {
+    const delta =
+      event.delta && typeof event.delta === "object"
+        ? (event.delta as Record<string, unknown>)
+        : null;
+    detail += `:${safeProtocolLabel(delta?.type)}`;
+  } else if (eventType === "error") {
+    const upstreamError =
+      event.error && typeof event.error === "object"
+        ? (event.error as Record<string, unknown>)
+        : null;
+    detail += `:${safeProtocolLabel(upstreamError?.type)}:${safeProtocolLabel(upstreamError?.code)}`;
+  }
+  state.recentEvents.push(detail);
+  if (state.recentEvents.length > 12) state.recentEvents.shift();
 }
 
 function assertInMessage(
@@ -241,6 +292,7 @@ function handleMessageStart(state: ProtocolState): null {
 function blockKind(block: Record<string, unknown>): BlockKind {
   if (block.type === "thinking") return "thinking";
   if (block.type === "text") return "text";
+  if (block.type === "tool_use" || block.type === "server_tool_use") return "tool";
   return "other";
 }
 
@@ -254,18 +306,30 @@ function handleContentBlockStart(
 
   const kind = blockKind(requireRecord(event.content_block, "content_block"));
   state.openBlocks.set(index, kind);
+  state.seenBlocks.set(index, kind);
   return kind === "thinking" ? { kind: "reasoning", text: "" } : null;
 }
 
 function handleContentBlockDelta(
   event: Record<string, unknown>,
   state: ProtocolState
-): SemanticEvent {
+): SemanticEvent | null {
   assertInMessage(state, "content_block_delta");
-  const block = state.openBlocks.get(requireBlockIndex(event));
-  if (!block) protocolFailure(state, "Content delta has no open block");
-
+  const index = requireBlockIndex(event);
   const delta = requireRecord(event.delta, "delta");
+  const block = state.openBlocks.get(index);
+  if (!block) {
+    // Claude Web can refine a thinking summary after that thinking block has
+    // closed and a first-party tool block has started. Accept only this known
+    // retrospective delta and only for an index previously opened as thinking.
+    if (
+      delta.type === "thinking_summary_delta" &&
+      state.seenBlocks.get(index) === "thinking"
+    ) {
+      return { kind: "reasoning", text: thinkingSummaryText(delta) };
+    }
+    return protocolFailure(state, "Content delta has no open block");
+  }
   if (delta.type === "text_delta" && block === "text") {
     return { kind: "content", text: deltaText(delta, ["text"]) };
   }
@@ -275,7 +339,36 @@ function handleContentBlockDelta(
   if (delta.type === "thinking_summary_delta" && block === "thinking") {
     return { kind: "reasoning", text: thinkingSummaryText(delta) };
   }
-  return protocolFailure(state, "Content delta type does not match its block");
+  if (delta.type === "input_json_delta" && block === "tool") {
+    if (typeof delta.partial_json !== "string") {
+      return protocolFailure(state, "Tool input delta JSON is invalid");
+    }
+    // Claude Web executes its own first-party tools (for example web search)
+    // inside the same completion. Keep validating the protocol, but do not leak
+    // internal tool arguments into the OpenAI-compatible answer stream.
+    return null;
+  }
+  if (delta.type === "tool_use_block_update_delta" && block === "tool") {
+    // This is Claude Web's progress/update frame for a first-party tool. Its
+    // payload is UI state, not answer content, so validate the recognized event
+    // type and intentionally keep it off the OpenAI-compatible wire response.
+    return null;
+  }
+  if (
+    block === "text" &&
+    (delta.type === "citation_start_delta" ||
+      delta.type === "citation_delta" ||
+      delta.type === "citation_end_delta")
+  ) {
+    // Claude Web emits citations as deltas inside the surrounding text block.
+    // The raw event has already gone through the citation normalizer above;
+    // this branch only keeps the strict block-order validator in sync.
+    return null;
+  }
+  return protocolFailure(
+    state,
+    `Content delta type ${safeProtocolLabel(delta.type)} does not match block ${safeProtocolLabel(block)}`
+  );
 }
 
 function handleContentBlockStop(event: Record<string, unknown>, state: ProtocolState): null {
@@ -325,7 +418,10 @@ function dispatchProtocolEvent(
     case "error":
       return protocolFailure(state, "Upstream reported a stream error");
     default:
-      return protocolFailure(state, "Unknown Claude Web stream event");
+      return protocolFailure(
+        state,
+        `Unknown Claude Web stream event (${safeProtocolLabel(eventType)})`
+      );
   }
 }
 
@@ -336,7 +432,9 @@ async function* parseClaudeWebEvents(
   const state: ProtocolState = {
     phase: "awaiting_message",
     openBlocks: new Map(),
+    seenBlocks: new Map(),
     stopReason: "end_turn",
+    recentEvents: [],
   };
 
   for await (const data of decodeSseData(source, control)) {
@@ -345,6 +443,11 @@ async function* parseClaudeWebEvents(
     }
 
     const { event, eventType } = parseProtocolEvent(data, state);
+    recordProtocolEvent(state, eventType, event);
+    const citationResult = normalizeCitationsFromResponse(event);
+    if (citationResult.metadata.status !== "none") {
+      yield { kind: "citations", result: citationResult };
+    }
     if (KNOWN_METADATA_EVENTS.has(eventType)) {
       yield { kind: "metadata", eventType, data: projectMetadataEvent(eventType, event) };
       continue;
@@ -372,8 +475,13 @@ function makeChunk(
   options: ClaudeWebStreamOptions,
   delta: Record<string, unknown>,
   finishReason: string | null,
-  event?: { type: string; data: Record<string, unknown> }
+  event?: { type: string; data: Record<string, unknown> },
+  citationResult?: CitationNormalizationResult
 ): Record<string, unknown> {
+  const omniroute = {
+    ...(options.provenance ? { provenance: options.provenance } : {}),
+    ...(citationResult ? { citations: citationResult.metadata } : {}),
+  };
   return {
     id,
     object: "chat.completion.chunk",
@@ -391,6 +499,7 @@ function makeChunk(
       ...options.responseMetadata,
       ...(event ? { event } : {}),
     },
+    ...(Object.keys(omniroute).length > 0 ? { omniroute } : {}),
   };
 }
 
@@ -448,17 +557,20 @@ async function createBufferedResponse(
   let reasoningText = "";
   let stopReason = "end_turn";
   const metadataEvents: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const citationResults: CitationNormalizationResult[] = [];
   const control: StreamControl = { reader: null, cancelled: false };
 
   try {
     for await (const event of parseClaudeWebEvents(source, control)) {
       if (event.kind === "content") assistantText += event.text;
       if (event.kind === "reasoning") reasoningText += event.text;
+      if (event.kind === "citations") citationResults.push(event.result);
       if (event.kind === "metadata") {
         metadataEvents.push({ type: event.eventType, data: event.data });
       }
       if (event.kind === "finish") stopReason = event.stopReason;
     }
+    const citations = mergeCitationResults(...citationResults);
     notifyComplete(options, { assistantText, stopReason });
     return new Response(
       JSON.stringify({
@@ -472,6 +584,7 @@ async function createBufferedResponse(
             message: {
               role: "assistant",
               content: assistantText,
+              annotations: citations.annotations,
               ...(reasoningText ? { reasoning_content: reasoningText } : {}),
             },
             finish_reason: openAiFinishReason(stopReason),
@@ -482,14 +595,18 @@ async function createBufferedResponse(
           ...options.responseMetadata,
           events: metadataEvents,
         },
+        omniroute: {
+          citations: citations.metadata,
+          ...(options.provenance ? { provenance: options.provenance } : {}),
+        },
       }),
       {
         status: 200,
         headers: responseHeaders("application/json", options.responseMetadata),
       }
     );
-  } catch {
-    options.log?.error?.("CLAUDE-WEB-STREAM", "Claude Web stream protocol validation failed");
+  } catch (error) {
+    options.log?.error?.("CLAUDE-WEB-STREAM", protocolDiagnostic(error));
     notifyFailure(options);
     return new Response(JSON.stringify(protocolErrorBody()), {
       status: 502,
@@ -506,6 +623,7 @@ interface StreamingState {
   iterator: AsyncIterator<SemanticEvent, void, void>;
   pendingChunks: Uint8Array[];
   assistantText: string;
+  citations: CitationNormalizationResult;
   outcome: "pending" | "completed" | "failed";
   terminal: boolean;
   closed: boolean;
@@ -569,6 +687,33 @@ async function queueSemanticEvent(
     );
     return;
   }
+  if (event.kind === "citations") {
+    const priorUrls = new Set(
+      state.citations.annotations.map((annotation) => annotation.url_citation.url)
+    );
+    const previousStatus = state.citations.metadata.status;
+    state.citations = mergeCitationResults(state.citations, event.result);
+    const annotations = state.citations.annotations.filter(
+      (annotation) => !priorUrls.has(annotation.url_citation.url)
+    );
+    if (annotations.length > 0 || state.citations.metadata.status !== previousStatus) {
+      state.pendingChunks.push(
+        encodeStreamEvent(
+          state,
+          makeChunk(
+            state.id,
+            state.created,
+            options,
+            annotations.length > 0 ? { annotations } : {},
+            null,
+            undefined,
+            state.citations
+          )
+        )
+      );
+    }
+    return;
+  }
   if (event.kind === "metadata") {
     state.pendingChunks.push(
       encodeStreamEvent(
@@ -588,15 +733,27 @@ async function queueSemanticEvent(
   state.pendingChunks.push(
     encodeStreamEvent(
       state,
-      makeChunk(state.id, state.created, options, {}, openAiFinishReason(event.stopReason))
+      makeChunk(
+        state.id,
+        state.created,
+        options,
+        {},
+        openAiFinishReason(event.stopReason),
+        undefined,
+        state.citations
+      )
     )
   );
   state.pendingChunks.push(state.encoder.encode("data: [DONE]\n\n"));
   state.terminal = true;
 }
 
-function queueStreamFailure(state: StreamingState, options: ClaudeWebStreamOptions): void {
-  options.log?.error?.("CLAUDE-WEB-STREAM", "Claude Web stream protocol validation failed");
+function queueStreamFailure(
+  state: StreamingState,
+  options: ClaudeWebStreamOptions,
+  error: unknown
+): void {
+  options.log?.error?.("CLAUDE-WEB-STREAM", protocolDiagnostic(error));
   failStreamOnce(state, options);
   state.pendingChunks.push(encodeStreamEvent(state, protocolErrorBody()));
   state.pendingChunks.push(state.encoder.encode("data: [DONE]\n\n"));
@@ -627,9 +784,9 @@ async function pullStreamingChunk(
         return;
       }
     }
-  } catch {
+  } catch (error) {
     if (state.control.cancelled) return;
-    queueStreamFailure(state, options);
+    queueStreamFailure(state, options, error);
     flushStreamChunk(state, controller);
   }
 }
@@ -665,6 +822,7 @@ function createStreamingResponse(
     iterator: parseClaudeWebEvents(source, control)[Symbol.asyncIterator](),
     pendingChunks: [],
     assistantText: "",
+    citations: mergeCitationResults(),
     outcome: "pending",
     terminal: false,
     closed: false,

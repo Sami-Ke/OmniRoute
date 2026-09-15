@@ -2,10 +2,12 @@ import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import {
   getSession,
+  exportSessionCredentials,
   harvestSession,
   listSessions,
   markViewerActive,
   startSession,
+  startProviderSession,
   stopSession,
   type VncSession,
 } from "@/lib/vncSession/service";
@@ -43,7 +45,9 @@ function errorResponse(status: number, error: unknown) {
  * GET    /api/vnc-session/:connectionId                 list sessions for connection
  * GET    /api/vnc-session/:connectionId/:sessionId      session state
  * POST   /api/vnc-session/:connectionId/start           start a browser session
+ * POST   /api/vnc-session/provider/:providerId/start    start without a connection
  * POST   /api/vnc-session/:connectionId/:sessionId/harvest
+ * POST   /api/vnc-session/:connectionId/:sessionId/export
  * POST   /api/vnc-session/:connectionId/:sessionId/touch
  * DELETE /api/vnc-session/:connectionId/:sessionId      stop and remove session
  *
@@ -77,6 +81,18 @@ export async function POST(
   if (authError) return authError;
 
   const { params: segments } = await params;
+  if (segments?.[0] === "provider" && segments?.[1] && segments?.[2] === "start") {
+    try {
+      const session = await startProviderSession(segments[1]);
+      return NextResponse.json({
+        session: publicSession(session),
+        note: "This is a local capture session only. It does not create or update a provider connection; use the export action after signing in.",
+      });
+    } catch (error) {
+      return errorResponse(500, error);
+    }
+  }
+
   const connectionId = segments?.[0];
   const second = segments?.[1];
   const action = segments?.[2];
@@ -87,8 +103,7 @@ export async function POST(
       const session = await startSession(connectionId);
       return NextResponse.json({
         session: publicSession(session),
-        note:
-          "The viewer is loopback-only. Open it on the OmniRoute host or forward its port over SSH, then harvest the session.",
+        note: "The viewer is loopback-only. Open it on the OmniRoute host or forward its port over SSH, then harvest the session.",
       });
     }
 
@@ -101,11 +116,18 @@ export async function POST(
         validation: result.validation
           ? {
               ...result.validation,
-              error: result.validation.error
-                ? sanitizeErrorMessage(result.validation.error)
-                : null,
+              error: result.validation.error ? sanitizeErrorMessage(result.validation.error) : null,
             }
           : null,
+      });
+    }
+    if (action === "export") {
+      const result = await exportSessionCredentials(connectionId, second);
+      return NextResponse.json(result, {
+        headers: {
+          "Cache-Control": "no-store, max-age=0",
+          Pragma: "no-cache",
+        },
       });
     }
     if (action === "touch") {

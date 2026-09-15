@@ -15,11 +15,7 @@ import {
   getCodexEffectiveServiceTier,
   type CodexGlobalServiceMode,
 } from "@/lib/providers/codexFastTier";
-import {
-  normalizeCodexLimitPolicy,
-  providerText,
-  ERROR_TYPE_LABELS,
-} from "../providerPageHelpers";
+import { normalizeCodexLimitPolicy, providerText, ERROR_TYPE_LABELS } from "../providerPageHelpers";
 import { getCodexPlanLabel } from "../codexPlanLabel";
 import ProviderQuotaVisibilityToggle from "./ProviderQuotaVisibilityToggle";
 

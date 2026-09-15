@@ -16,10 +16,7 @@ import {
 import { prepareToolMessages } from "../translator/webTools.ts";
 import { buildToolModeResponse } from "./chatgptWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
-import {
-  buildSessionCookieHeader,
-  mergeRefreshedCookie,
-} from "../utils/nextAuthCookie.ts";
+import { buildSessionCookieHeader, mergeRefreshedCookie } from "../utils/nextAuthCookie.ts";
 import {
   PPLX_SSE_ENDPOINT,
   PPLX_USER_AGENT,
@@ -33,6 +30,11 @@ import {
   extractContent,
   sseChunk,
 } from "./perplexity-web/protocol.ts";
+import {
+  mergeCitationResults,
+  normalizeCitationCandidates,
+  type CitationNormalizationResult,
+} from "../translator/citationNormalizer.ts";
 
 // ─── Session continuity ─────────────────────────────────────────────────────
 
@@ -128,9 +130,38 @@ function buildStreamingResponse(
 
           let fullAnswer = "";
           let respBackendUuid: string | null = null;
+          let citationResult: CitationNormalizationResult = normalizeCitationCandidates([]);
 
           for await (const chunk of extractContent(eventStream, signal)) {
             if (chunk.backendUuid) respBackendUuid = chunk.backendUuid;
+
+            if (chunk.citations) {
+              const next = normalizeCitationCandidates(chunk.citations, "$.perplexity.web_results");
+              const previousCount = citationResult.annotations.length;
+              citationResult = mergeCitationResults(citationResult, next);
+              const newAnnotations = citationResult.annotations.slice(previousCount);
+              if (newAnnotations.length > 0) {
+                controller.enqueue(
+                  encoder.encode(
+                    sseChunk({
+                      id: cid,
+                      object: "chat.completion.chunk",
+                      created,
+                      model,
+                      system_fingerprint: null,
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { annotations: newAnnotations },
+                          finish_reason: null,
+                          logprobs: null,
+                        },
+                      ],
+                    })
+                  )
+                );
+              }
+            }
 
             if (chunk.error) {
               controller.enqueue(
@@ -268,9 +299,16 @@ async function buildNonStreamingResponse(
   let fullAnswer = "";
   let respBackendUuid: string | null = null;
   const thinkingParts: string[] = [];
+  let citationResult: CitationNormalizationResult = normalizeCitationCandidates([]);
 
   for await (const chunk of extractContent(eventStream, signal)) {
     if (chunk.backendUuid) respBackendUuid = chunk.backendUuid;
+    if (chunk.citations) {
+      citationResult = mergeCitationResults(
+        citationResult,
+        normalizeCitationCandidates(chunk.citations, "$.perplexity.web_results")
+      );
+    }
     if (chunk.error) {
       // Quota exhaustion → 429 + reset_seconds so OmniRoute marks rate_limited_until
       // and VibeProxy limit badges / rotation skip parse the same shape as model_cooldown.
@@ -311,6 +349,7 @@ async function buildNonStreamingResponse(
 
   const reasoningContent = thinkingParts.length > 0 ? thinkingParts.join("\n") : undefined;
   const msg: Record<string, unknown> = { role: "assistant", content: fullAnswer };
+  msg.annotations = citationResult.annotations;
   if (reasoningContent) msg.reasoning_content = reasoningContent;
 
   const promptTokens = Math.ceil(currentMsg.length / 4);
@@ -362,7 +401,15 @@ export class PerplexityWebExecutor extends BaseExecutor {
     super("perplexity-web", { id: "perplexity-web", baseUrl: PPLX_SSE_ENDPOINT });
   }
 
-  async execute({ model, body, stream, credentials, signal, log, onCredentialsRefreshed }: ExecuteInput) {
+  async execute({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    log,
+    onCredentialsRefreshed,
+  }: ExecuteInput) {
     const bodyObj = (body || {}) as Record<string, unknown>;
     const rawMessages = bodyObj.messages as Array<Record<string, unknown>> | undefined;
     if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) {

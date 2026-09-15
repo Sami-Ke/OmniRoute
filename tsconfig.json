@@ -40,7 +40,9 @@
     ".next-playwright/dev/types/**/*.ts",
     ".build/next/types/**/*.ts",
     ".build/next/dev/types/**/*.ts",
-    ".build/next/dev/dev/types/**/*.ts"
+    ".build/next/dev/dev/types/**/*.ts",
+    "/private/tmp/omniroute-next-gemini-live/types/**/*.ts",
+    "/private/tmp/omniroute-next-gemini-live/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",
@@ -53,6 +55,7 @@
     ".source",
     ".tmp",
     ".claude",
+    "private",
     ".worktrees",
     "@omniroute",
     "_tasks",

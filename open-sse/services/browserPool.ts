@@ -137,6 +137,12 @@ function isPoolEnabled(): boolean {
   return flag !== "off" && flag !== "0" && flag !== "false";
 }
 
+function isBrowserHeadless(): boolean {
+  const flag = process.env.OMNIROUTE_BROWSER_HEADLESS?.trim().toLowerCase();
+  if (flag === "0" || flag === "false" || flag === "off" || flag === "no") return false;
+  return true;
+}
+
 function resetIdleTimer(): void {
   if (state.idleTimer) clearTimeout(state.idleTimer);
   state.idleTimer = setTimeout(() => {
@@ -227,10 +233,11 @@ async function launchBrowser(): Promise<Browser> {
   if (state.launching) return state.launching;
   state.launching = (async () => {
     const cloakLaunch = await resolveCloakLaunch();
+    const headless = isBrowserHeadless();
     let browser: Browser;
     if (cloakLaunch) {
       browser = await cloakLaunch({
-        headless: true,
+        headless,
         args: ["--no-sandbox", "--disable-dev-shm-usage"],
       });
     } else {
@@ -238,7 +245,7 @@ async function launchBrowser(): Promise<Browser> {
       // auth) but DDG's VQD challenge will detect this Chromium build.
       const { chromium } = await import("playwright");
       browser = await chromium.launch({
-        headless: true,
+        headless,
         args: [
           "--no-sandbox",
           "--disable-dev-shm-usage",
@@ -262,12 +269,11 @@ async function launchBrowser(): Promise<Browser> {
 
 function parseCookieString(
   raw: string,
-  domain: string
+  cookieUrl: string
 ): Array<{
   name: string;
   value: string;
-  domain: string;
-  path: string;
+  url: string;
   expires: number;
   httpOnly: boolean;
   secure: boolean;
@@ -286,8 +292,10 @@ function parseCookieString(
       return {
         name,
         value,
-        domain: domain.startsWith(".") ? domain : `.${domain}`,
-        path: "/",
+        // Use a host-only URL instead of forcing a Domain attribute. This is
+        // required for __Host-* cookies (for example ChatGPT's CSRF cookie),
+        // which Chromium rejects when a domain is supplied.
+        url: cookieUrl,
         expires: -1,
         httpOnly: false,
         secure: true,
@@ -297,8 +305,7 @@ function parseCookieString(
     .filter(Boolean) as Array<{
     name: string;
     value: string;
-    domain: string;
-    path: string;
+    url: string;
     expires: number;
     httpOnly: boolean;
     secure: boolean;
@@ -351,7 +358,18 @@ export async function acquireBrowserContext(
     });
 
     if (options.cookieString) {
-      const cookies = parseCookieString(options.cookieString, options.cookieDomain);
+      const cookieUrl = (() => {
+        if (options.warmupUrl) {
+          try {
+            return `${new URL(options.warmupUrl).origin}/`;
+          } catch {
+            // Fall through to the provider-domain-derived URL.
+          }
+        }
+        const host = options.cookieDomain.replace(/^\./, "");
+        return `https://${host}/`;
+      })();
+      const cookies = parseCookieString(options.cookieString, cookieUrl);
       if (cookies.length > 0) {
         await context.addCookies(cookies);
       }

@@ -1,26 +1,18 @@
 /**
  * Real-completion connection probe (mode: "completion").
  *
- * The default connection test only validates credentials (e.g. chatgpt-web probes
- * /api/auth/session), which can report "valid" while real conversations are blocked
- * further down the pipeline (Sentinel/Turnstile on the conversation endpoint was the
- * motivating incident). This probe sends one real, non-streaming chat completion
- * through handleChatCore pinned to the connection under test — no pool selection,
- * no account fallback, no retry rotation — so the result reflects what live traffic
- * on THIS connection would actually get.
+ * The default connection test validates credentials only. This probe sends one
+ * non-streaming completion through the connection being tested so the result
+ * also covers provider-side conversation gates such as ChatGPT Sentinel.
  */
 import { getProviderCredentials } from "@/sse/services/auth";
 import { handleChatCore } from "@omniroute/open-sse/handlers/chatCore.ts";
+import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
-// One probe = one upstream conversation; bound it so a hung upstream cannot
-// occupy the connection-test queue (mirrors OAUTH_TEST_TIMEOUT_MS intent, but
-// completions on thinking-capable web providers legitimately take longer).
 export const COMPLETION_PROBE_TIMEOUT_MS = 90_000;
 
 const PROBE_PROMPT = "Reply with exactly: OK";
-// Small but not tiny: leaves room for providers that spend a few tokens on
-// forced reasoning preambles before the visible answer.
 const PROBE_MAX_TOKENS = 64;
 
 export type CompletionProbeResult = {
@@ -39,9 +31,6 @@ type ProbeDeps = {
 };
 
 function defaultGetCredentials(provider: string, connectionId: string, model: string) {
-  // The operator is explicitly re-testing this connection, so selection must not
-  // hide it behind its own cooldown/error state — that state is exactly what the
-  // probe is trying to refresh.
   return getProviderCredentials(provider, null, [connectionId], model, {
     forcedConnectionId: connectionId,
     allowSuppressedConnections: true,
@@ -56,6 +45,32 @@ function probeFailure(
   statusCode: number | null = null
 ): CompletionProbeResult {
   return { valid: false, error, statusCode, model, content: null, latencyMs };
+}
+
+/**
+ * ChatGPT Web has a registered model that is intended for free, Plus, and Pro
+ * tiers. Use it only when the caller and connection did not provide a model;
+ * other providers must still opt into a concrete default to avoid guessing
+ * which account-specific model is usable.
+ */
+function resolveProbeModel(
+  connection: any,
+  requestedModel: string | null | undefined
+): string | null {
+  const requested = typeof requestedModel === "string" ? requestedModel.trim() : "";
+  if (requested) return requested;
+
+  const configured =
+    typeof connection?.defaultModel === "string" ? connection.defaultModel.trim() : "";
+  if (configured) return configured;
+
+  if (connection?.provider === "chatgpt-web") {
+    const entry = getRegistryEntry("chatgpt-web");
+    const fallback = entry?.models?.find((candidate) => candidate.id === "gpt-5.5");
+    return fallback?.id || null;
+  }
+
+  return null;
 }
 
 export async function runCompletionProbe(
@@ -75,10 +90,7 @@ export async function runCompletionProbe(
     return probeFailure("Connection provider is invalid", Date.now() - started, null);
   }
 
-  const model =
-    (typeof requestedModel === "string" && requestedModel.trim()) ||
-    (typeof connection?.defaultModel === "string" && connection.defaultModel.trim()) ||
-    null;
+  const model = resolveProbeModel(connection, requestedModel);
   if (!model) {
     return probeFailure(
       "No model to probe — pass completionModel in the request body or set a default model on the connection",
@@ -144,7 +156,11 @@ export async function runCompletionProbe(
   }
 
   const response: Response | null =
-    result instanceof Response ? result : result?.response instanceof Response ? result.response : null;
+    result instanceof Response
+      ? result
+      : result?.response instanceof Response
+        ? result.response
+        : null;
   if (!response) {
     return probeFailure("Completion probe produced no response", Date.now() - started, model);
   }
@@ -159,11 +175,11 @@ export async function runCompletionProbe(
     const rawError = data?.error?.message;
     upstreamError = typeof rawError === "string" ? rawError : null;
   } catch {
-    // Non-JSON body (unexpected for stream:false) — status alone decides validity.
+    // Non-JSON body: status still determines whether the probe passed.
   }
 
   const latencyMs = Date.now() - started;
-  if (statusCode === 200) {
+  if (statusCode >= 200 && statusCode < 300) {
     return { valid: true, error: null, statusCode, model, content, latencyMs };
   }
   return {

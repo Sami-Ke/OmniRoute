@@ -13,7 +13,35 @@ export interface VncProviderEntry {
   url: string;
   /** Canonical OmniRoute credential contract for this provider. */
   requirement: Exclude<WebSessionCredentialRequirement, { kind: "none" }>;
+  /** Optional, narrowly scoped Network capture for providers that do not expose the token in storage. */
+  networkCapture?: VncNetworkCaptureRule;
 }
+
+export interface VncNetworkCaptureRule {
+  /** Only requests whose URL origin is listed here may contribute a value. */
+  allowedOrigins: readonly string[];
+  /** Header value is normalized from `Authorization: Bearer <token>`. */
+  authorizationOutputKey?: string;
+}
+
+const VNC_NETWORK_CAPTURE_RULES: Readonly<Record<string, VncNetworkCaptureRule>> = {
+  "copilot-web": {
+    allowedOrigins: ["https://copilot.microsoft.com"],
+    authorizationOutputKey: "access_token",
+  },
+  "microsoft-designer-web": {
+    allowedOrigins: ["https://designer.microsoft.com"],
+    authorizationOutputKey: "access_token",
+  },
+  promptql: {
+    allowedOrigins: ["https://prompt.ql.app"],
+    authorizationOutputKey: "jwt",
+  },
+  "adobe-firefly": {
+    allowedOrigins: ["https://firefly-3p.ff.adobe.io"],
+    authorizationOutputKey: "access_token",
+  },
+};
 
 /**
  * Providers whose credentials cannot yet be reconstructed safely from cookies,
@@ -29,8 +57,7 @@ export function getVncProvider(id: string | null | undefined): VncProviderEntry 
   if (!id || VNC_UNSUPPORTED_PROVIDER_REASONS[id]) return null;
 
   const catalog = WEB_COOKIE_PROVIDERS[id as keyof typeof WEB_COOKIE_PROVIDERS] as
-    | { id: string; name: string; website?: string }
-    | undefined;
+    { id: string; name: string; website?: string } | undefined;
   const requirement = getWebSessionCredentialRequirement(id);
 
   if (
@@ -48,6 +75,7 @@ export function getVncProvider(id: string | null | undefined): VncProviderEntry 
     name: catalog.name,
     url: catalog.website,
     requirement,
+    networkCapture: VNC_NETWORK_CAPTURE_RULES[id],
   };
 }
 

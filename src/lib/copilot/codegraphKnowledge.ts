@@ -60,14 +60,14 @@ function getDbPath(): string | null {
   let dir = __dirname;
   for (let i = 0; i < 10; i++) {
     const candidate = join(dir, ".codegraph", "codegraph.db");
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(/* turbopackIgnore: true */ candidate)) return candidate;
     const parent = join(dir, "..");
     if (parent === dir) break;
     dir = parent;
   }
 
   for (const c of candidates) {
-    if (existsSync(c)) return c;
+    if (existsSync(/* turbopackIgnore: true */ c)) return c;
   }
 
   return null;

@@ -12,9 +12,31 @@ export interface HarvestResult {
   cookies: HarvestCookie[];
   /** Declared values discovered in localStorage, sessionStorage, or page URLs. */
   localStorage: Record<string, string>;
+  /** Values captured from explicitly allowlisted Network headers. */
+  network?: Record<string, string>;
   /** Full Cookie header for the provider origin, only when the canonical contract allows it. */
   cookieHeader: string;
+  /** Browser UA needed by providers whose anti-bot clearance is UA-bound. */
+  userAgent?: string;
   hasCredential: boolean;
+}
+
+/**
+ * Explicit, local-only output intended for manually filling a Zeabur
+ * OmniRoute connection. This type is returned only by the opt-in export
+ * endpoint; normal harvesting and validation responses never include values.
+ */
+export interface ManualCredentialExport {
+  providerId: string;
+  providerName: string;
+  providerUrl: string;
+  credentialKind: "cookie" | "token";
+  credentialName: string;
+  pasteTarget: "apiKey";
+  pasteValue: string | null;
+  providerSpecificData: Record<string, string>;
+  hasCredential: boolean;
+  notes: string[];
 }
 
 interface Pending {
@@ -22,6 +44,8 @@ interface Pending {
   reject: (error: Error) => void;
   cleanup: () => void;
 }
+
+type CdpEventHandler = (params: any) => void;
 
 export interface CdpTargetInfo {
   targetId: string;
@@ -33,6 +57,7 @@ class CdpClient {
   private readonly ws: WebSocket;
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
+  private readonly eventHandlers = new Map<string, Set<CdpEventHandler>>();
   private sessionId: string | null = null;
   private closed = false;
 
@@ -92,6 +117,16 @@ class CdpClient {
       return;
     }
 
+    if (typeof message.method === "string") {
+      for (const handler of this.eventHandlers.get(message.method) || []) {
+        try {
+          handler(message.params || {});
+        } catch {
+          // An observation callback must never break the CDP command channel.
+        }
+      }
+    }
+
     if (typeof message.id !== "number") return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
@@ -103,6 +138,16 @@ class CdpClient {
     } else {
       pending.resolve(message.result);
     }
+  }
+
+  on(method: string, handler: CdpEventHandler): () => void {
+    const handlers = this.eventHandlers.get(method) || new Set<CdpEventHandler>();
+    handlers.add(handler);
+    this.eventHandlers.set(method, handlers);
+    return () => {
+      handlers.delete(handler);
+      if (handlers.size === 0) this.eventHandlers.delete(method);
+    };
   }
 
   private rejectAll(error: Error): void {
@@ -201,6 +246,16 @@ class CdpClient {
     return result.cookies || [];
   }
 
+  async sendToPage(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs = 10_000,
+    signal?: AbortSignal
+  ): Promise<any> {
+    if (!this.sessionId) throw new Error("CDP page target is not attached");
+    return this.send(method, params, this.sessionId, timeoutMs, signal);
+  }
+
   async getDeclaredStorage(
     keys: readonly string[],
     signal?: AbortSignal
@@ -240,6 +295,20 @@ class CdpClient {
     return value && typeof value === "object" ? value : {};
   }
 
+  async getUserAgent(signal?: AbortSignal): Promise<string | null> {
+    if (!this.sessionId) throw new Error("CDP page target is not attached");
+
+    const result = await this.send(
+      "Runtime.evaluate",
+      { expression: "navigator.userAgent", returnByValue: true },
+      this.sessionId,
+      10_000,
+      signal
+    );
+    const value = result?.result?.value;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -252,6 +321,76 @@ class CdpClient {
   }
 }
 
+/**
+ * Long-lived, allowlisted Network observer attached to a browser-login page.
+ * It stores only the normalized Bearer value, never the complete request or
+ * header map, and is closed when the browser session stops.
+ */
+export class NetworkCredentialCapture {
+  private readonly values: Record<string, string> = {};
+  private readonly requestUrls = new Map<string, string>();
+  private readonly unregister: Array<() => void> = [];
+
+  constructor(
+    private readonly client: CdpClient,
+    private readonly allowedOrigins: readonly string[],
+    private readonly outputKey: string
+  ) {
+    this.unregister.push(
+      client.on("Network.requestWillBeSent", (params) => {
+        const requestId = typeof params.requestId === "string" ? params.requestId : "";
+        const url = typeof params.request?.url === "string" ? params.request.url : "";
+        if (requestId && url) {
+          if (this.requestUrls.size >= 2048) this.requestUrls.clear();
+          this.requestUrls.set(requestId, url);
+        }
+        this.capture(url, params.request?.headers);
+      })
+    );
+    this.unregister.push(
+      client.on("Network.requestWillBeSentExtraInfo", (params) => {
+        const requestId = typeof params.requestId === "string" ? params.requestId : "";
+        this.capture(requestId ? this.requestUrls.get(requestId) || "" : "", params.headers);
+      })
+    );
+    this.unregister.push(
+      client.on("Network.webSocketWillSendHandshakeRequest", (params) => {
+        this.capture(params.url, params.request?.headers);
+      })
+    );
+  }
+
+  snapshot(): Record<string, string> {
+    return { ...this.values };
+  }
+
+  close(): void {
+    for (const remove of this.unregister.splice(0)) remove();
+    this.client.close();
+  }
+
+  private capture(rawUrl: string, headers: unknown): void {
+    if (!rawUrl || !headers || typeof headers !== "object") return;
+
+    let origin = "";
+    try {
+      origin = new URL(rawUrl).origin;
+    } catch {
+      return;
+    }
+    if (!this.allowedOrigins.includes(origin)) return;
+
+    const authorizationEntry = Object.entries(headers as Record<string, unknown>).find(
+      ([name]) => name.toLowerCase() === "authorization"
+    );
+    const authorization = authorizationEntry?.[1];
+    if (typeof authorization !== "string") return;
+
+    const match = authorization.trim().match(/^Bearer\s+(.+)$/i);
+    if (match?.[1]) this.values[this.outputKey] = match[1].trim();
+  }
+}
+
 export async function waitForCdpReady(cdpPort: number, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: Error | null = null;
@@ -260,7 +399,10 @@ export async function waitForCdpReady(cdpPort: number, timeoutMs: number): Promi
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2_000);
     try {
-      const version = await fetchJson(`http://127.0.0.1:${cdpPort}/json/version`, controller.signal);
+      const version = await fetchJson(
+        `http://127.0.0.1:${cdpPort}/json/version`,
+        controller.signal
+      );
       if (version?.webSocketDebuggerUrl) return;
       lastError = new Error("CDP endpoint did not return a websocket URL");
     } catch (error) {
@@ -274,20 +416,59 @@ export async function waitForCdpReady(cdpPort: number, timeoutMs: number): Promi
   throw new Error(`Browser did not become ready: ${lastError?.message || "CDP timeout"}`);
 }
 
+export async function startNetworkCredentialCapture(
+  cdpPort: number,
+  provider: VncProviderEntry,
+  timeoutMs = 15_000
+): Promise<NetworkCredentialCapture | null> {
+  const rule = provider.networkCapture;
+  if (!rule?.authorizationOutputKey) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let client: CdpClient | null = null;
+
+  try {
+    const version = await fetchJson(`http://127.0.0.1:${cdpPort}/json/version`, controller.signal);
+    const debuggerUrl = version?.webSocketDebuggerUrl;
+    if (typeof debuggerUrl !== "string" || !debuggerUrl) {
+      throw new Error("No CDP websocket endpoint from browser container");
+    }
+
+    client = new CdpClient(rewriteDebuggerUrl(debuggerUrl, cdpPort));
+    await client.ready(Math.min(timeoutMs, 15_000), controller.signal);
+    await client.attachToPage(new URL(provider.url).origin, controller.signal);
+
+    const capture = new NetworkCredentialCapture(
+      client,
+      rule.allowedOrigins,
+      rule.authorizationOutputKey
+    );
+    await client.sendToPage("Network.enable", {}, 10_000, controller.signal);
+    return capture;
+  } catch (error) {
+    client?.close();
+    if (controller.signal.aborted) {
+      throw new Error(`Network credential capture timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function harvestFromContainer(
   cdpPort: number,
   provider: VncProviderEntry,
-  timeoutMs = 20_000
+  timeoutMs = 20_000,
+  networkValues: Record<string, string> = {}
 ): Promise<HarvestResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let client: CdpClient | null = null;
 
   try {
-    const version = await fetchJson(
-      `http://127.0.0.1:${cdpPort}/json/version`,
-      controller.signal
-    );
+    const version = await fetchJson(`http://127.0.0.1:${cdpPort}/json/version`, controller.signal);
     const debuggerUrl = version?.webSocketDebuggerUrl;
     if (typeof debuggerUrl !== "string" || !debuggerUrl) {
       throw new Error("No CDP websocket endpoint from browser container");
@@ -298,9 +479,10 @@ export async function harvestFromContainer(
 
     const origin = new URL(provider.url).origin;
     await client.attachToPage(origin, controller.signal);
-    const [cookiesRaw, declaredStorage] = await Promise.all([
+    const [cookiesRaw, declaredStorage, userAgent] = await Promise.all([
       client.getCookies(provider.url, controller.signal),
       client.getDeclaredStorage(provider.requirement.storageKeys, controller.signal),
+      client.getUserAgent(controller.signal),
     ]);
 
     const cookies = cookiesRaw
@@ -320,7 +502,9 @@ export async function harvestFromContainer(
     const baseResult: HarvestResult = {
       cookies,
       localStorage: declaredStorage,
+      network: networkValues,
       cookieHeader,
+      userAgent: userAgent || undefined,
       hasCredential: false,
     };
     const credentials = harvestToCredentials(baseResult, provider);
@@ -352,7 +536,9 @@ export function harvestToCredentials(
   for (const key of requirement.storageKeys) {
     if (key === "cookie") continue;
     const value =
-      harvest.localStorage[key] || harvest.cookies.find((cookie) => cookie.name === key)?.value;
+      harvest.localStorage[key] ||
+      harvest.cookies.find((cookie) => cookie.name === key)?.value ||
+      harvest.network?.[key];
     if (value) providerSpecificData[key] = value;
   }
 
@@ -365,6 +551,10 @@ export function harvestToCredentials(
     return { providerSpecificData, apiKey: tokenValue };
   }
 
+  if (provider.id === "grok-web" && harvest.userAgent) {
+    providerSpecificData.customUserAgent = harvest.userAgent;
+  }
+
   if (
     requirement.acceptsFullCookieHeader &&
     requirement.storageKeys.includes("cookie") &&
@@ -374,6 +564,87 @@ export function harvestToCredentials(
   }
 
   return { providerSpecificData, apiKey: null };
+}
+
+/**
+ * Build a copy-friendly credential payload without persisting or validating it.
+ *
+ * The dashboard's web-session form accepts one raw credential in its primary
+ * field, so cookie providers export the full Cookie header and token providers
+ * export the raw token. T3 needs both a Cookie header and convex-session-id;
+ * its executor already accepts the structured single-field form emitted here.
+ */
+export function buildManualCredentialExport(
+  harvest: HarvestResult,
+  provider: VncProviderEntry
+): ManualCredentialExport {
+  const { providerSpecificData, apiKey } = harvestToCredentials(harvest, provider);
+  const notes = [provider.requirement.placeholder];
+  let pasteValue: string | null = provider.requirement.kind === "token" ? apiKey : null;
+
+  if (provider.id === "t3-web") {
+    const parts = [];
+    if (providerSpecificData.cookie) {
+      parts.push(`cookies=${providerSpecificData.cookie}`);
+    }
+    if (providerSpecificData.convexSessionId) {
+      parts.push(`convexSessionId=${providerSpecificData.convexSessionId}`);
+    }
+    pasteValue = parts.length > 0 ? parts.join("\n") : null;
+    if (!providerSpecificData.convexSessionId) {
+      notes.push(
+        "convexSessionId was not found; t3.chat requires it in addition to the Cookie header."
+      );
+    }
+  } else if (provider.id === "adobe-firefly") {
+    // The Firefly resolver prefers a user IMS JWT. A page Cookie alone may
+    // only produce a guest token, so make that limitation visible in the
+    // manual handoff instead of presenting it as a confirmed account token.
+    const accessToken =
+      providerSpecificData.access_token ||
+      providerSpecificData.accessToken ||
+      providerSpecificData.token;
+    pasteValue = accessToken || providerSpecificData.cookie || null;
+    if (!accessToken) {
+      notes.push(
+        "Adobe Firefly currently exposes only a Cookie value here; a user IMS access_token from an Authorization Bearer request is preferred and may still be required."
+      );
+    }
+  } else if (provider.requirement.kind === "cookie") {
+    pasteValue = providerSpecificData.cookie || null;
+  }
+
+  const networkOutputKey = provider.networkCapture?.authorizationOutputKey;
+  if (networkOutputKey && !providerSpecificData[networkOutputKey]) {
+    notes.push(
+      `No allowlisted Network Authorization value (${networkOutputKey}) was observed. Make the provider request in the browser, then export again.`
+    );
+  }
+
+  if (provider.id === "grok-web" && providerSpecificData.customUserAgent) {
+    notes.push(
+      "Keep customUserAgent unchanged in the target OmniRoute connection; Grok Cloudflare clearance is bound to the browser User-Agent."
+    );
+  }
+
+  if (!pasteValue) {
+    notes.push(
+      "No allowlisted credential was found. Finish signing in and trigger a provider request, then export again."
+    );
+  }
+
+  return {
+    providerId: provider.id,
+    providerName: provider.name,
+    providerUrl: provider.url,
+    credentialKind: provider.requirement.kind,
+    credentialName: provider.requirement.credentialName,
+    pasteTarget: "apiKey",
+    pasteValue,
+    providerSpecificData,
+    hasCredential: Boolean(pasteValue),
+    notes,
+  };
 }
 
 export function rewriteDebuggerUrl(debuggerUrl: string, cdpPort: number): string {

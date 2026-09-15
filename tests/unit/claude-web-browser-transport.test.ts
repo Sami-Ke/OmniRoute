@@ -5,6 +5,7 @@ import {
   __resetClaudeWebBrowserTemplatesForTesting,
   __setClaudeWebBrowserNowForTesting,
   applyClaudeWebBrowserTemplate,
+  applyClaudeWebDirectToolFallback,
   buildClaudeWebBrowserPoolKey,
   mergeClaudeWebBrowserPayload,
   sendClaudeWebBrowser,
@@ -390,6 +391,20 @@ describe("Claude Web account-scoped browser transport", () => {
     const withCallerTools = request();
     withCallerTools.payload = { ...withCallerTools.payload, tools: [callerTool] };
     assert.strictEqual(applyClaudeWebBrowserTemplate(withCallerTools), withCallerTools);
+  });
+
+  it("adds the native web-search tool only when direct transport has no tools", () => {
+    const withoutTools = request();
+    const withFallback = applyClaudeWebDirectToolFallback(withoutTools);
+    assert.deepEqual(withFallback.payload.tools, [
+      { name: "web_search", type: "web_search_v0" },
+    ]);
+    assert.deepEqual(withoutTools.payload.tools, []);
+
+    const callerTool = { name: "caller_tool", input_schema: { type: "object" } };
+    const withCallerTools = request();
+    withCallerTools.payload = { ...withCallerTools.payload, tools: [callerTool] };
+    assert.strictEqual(applyClaudeWebDirectToolFallback(withCallerTools), withCallerTools);
   });
 
   it("fails closed when a buffered browser response exceeds the hard size limit", async () => {

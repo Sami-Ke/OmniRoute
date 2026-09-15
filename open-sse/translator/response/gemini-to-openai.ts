@@ -13,6 +13,7 @@ import {
   isMalformedToolCallFinishReason,
 } from "../../utils/finishReason.ts";
 import { stripAnsiCodes } from "../../utils/streamHelpers.ts";
+import { normalizeCitationCandidates } from "../citationNormalizer.ts";
 
 type GeminiToOpenAIState = {
   functionIndex: number;
@@ -626,6 +627,10 @@ export function geminiToOpenAIResponse(chunk, state) {
     }
 
     if (citations.length > 0) {
+      const annotations = normalizeCitationCandidates(
+        citations,
+        "$.gemini.groundingChunks"
+      ).annotations;
       results.push({
         id: `chatcmpl-${state.messageId}`,
         object: "chat.completion.chunk",
@@ -634,7 +639,10 @@ export function geminiToOpenAIResponse(chunk, state) {
         choices: [
           {
             index: 0,
-            delta: { citations },
+            // Keep the legacy `citations` field on the internal translator
+            // result for compatibility; the shared stream normalizer converts
+            // it to OpenAI `annotations` before it reaches a client.
+            delta: { citations, annotations },
             finish_reason: null,
           },
         ],

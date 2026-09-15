@@ -8,6 +8,7 @@ const {
   solveHashcash,
   buildCopilotRequestHeaders,
   getCopilotUserIdentityType,
+  collectCopilotSseResponse,
 } = await import("../../open-sse/executors/copilot-web.ts");
 
 test("getCopilotMode maps known models to their Copilot modes", () => {
@@ -54,6 +55,12 @@ test("extractAccessToken extracts Bearer token from Authorization header", () =>
 test("extractAccessToken extracts a long Bearer token from a pasted Authorization header", () => {
   const token = "eyJhbGciOiJSUzI1NiJ9." + "x".repeat(180);
   assert.equal(extractAccessToken(`Authorization: Bearer ${token}`), token);
+});
+
+test("extractAccessToken unwraps the persisted login JSON credential", () => {
+  const token = "eyJhbGciOiJSUzI1NiJ9." + "x".repeat(180);
+  assert.equal(extractAccessToken(JSON.stringify({ access_token: token })), token);
+  assert.equal(extractAccessToken(JSON.stringify({ accessToken: token })), token);
 });
 
 test("extractAccessToken returns null for empty input", () => {
@@ -151,4 +158,78 @@ test("solveHashcash succeeds for difficulty=1 (a single leading zero is common)"
   // ~1 in 16 chance of leading "0" — well within the 10M iteration budget.
   const result = solveHashcash("any-parameter", 1);
   assert.ok(typeof result === "number" && result >= 0, "expected a numeric nonce");
+});
+
+test("collectCopilotSseResponse preserves text and citations across split SSE chunks", async () => {
+  const events = [
+    {
+      choices: [{ delta: { content: "Copilot " } }],
+    },
+    {
+      choices: [
+        {
+          delta: {
+            content: "answer",
+            reasoning_content: "reasoning",
+            annotations: [
+              {
+                type: "url_citation",
+                url_citation: {
+                  url: "https://source.example.test/copilot",
+                  title: "Copilot source",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          delta: {
+            annotations: [
+              {
+                type: "url_citation",
+                url_citation: {
+                  url: "https://source.example.test/copilot",
+                  title: "Duplicate",
+                },
+              },
+              {
+                type: "url_citation",
+                url_citation: { url: "javascript:alert(1)", title: "Invalid" },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+  const payload = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+  const encoder = new TextEncoder();
+  const splitAt = payload.indexOf("source.example.test") + 7;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(payload.slice(0, splitAt)));
+      controller.enqueue(encoder.encode(payload.slice(splitAt)));
+      controller.close();
+    },
+  });
+
+  const result = await collectCopilotSseResponse(stream);
+
+  assert.equal(result.content, "Copilot answer");
+  assert.equal(result.reasoningContent, "reasoning");
+  assert.deepEqual(result.annotations, [
+    {
+      type: "url_citation",
+      url_citation: {
+        url: "https://source.example.test/copilot",
+        title: "Copilot source",
+      },
+    },
+  ]);
+  assert.equal(result.citationMetadata.status, "found");
+  assert.equal(result.citationMetadata.invalid_candidates, 1);
 });
