@@ -350,3 +350,14 @@ RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-npm-cache,targe
     openclaw@2026.9.1
 
 USER node
+
+# Local-upload platforms such as Zeabur build the Dockerfile's final stage and
+# do not select the explicit runner-base/runner-web targets used by the official
+# publish workflow. Keep the CLI flavor available as an opt-in target, while
+# making the default image small enough to finish within those platforms'
+# build-time limit. Playwright remains present so ChatGPT Web can connect to an
+# externally managed Chromium/CDP runtime when configured.
+FROM runner-base AS runner-default
+
+COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-core
+COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
