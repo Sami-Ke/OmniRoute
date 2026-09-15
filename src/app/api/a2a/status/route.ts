@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { buildAgentCard } from "@/lib/a2a/agentCard";
 import { getTaskManager } from "@/lib/a2a/taskManager";
 import { getCachedSettings } from "@/lib/db/settings";
 
@@ -14,9 +15,7 @@ export async function GET(request?: NextRequest) {
     let agentCard: any = null;
     if (enabled) {
       try {
-        const agentModule = await import("../../../.well-known/agent.json/route");
-        const cardResponse = await agentModule.GET(request);
-        agentCard = await cardResponse.json();
+        agentCard = await buildAgentCard(request);
       } catch {
         agentCard = null;
       }
