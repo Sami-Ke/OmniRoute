@@ -93,6 +93,9 @@ ENV NPM_CONFIG_LEGACY_PEER_DEPS=true
 # are reproducible.
 RUN test -f package-lock.json \
   || (echo "package-lock.json is required for reproducible Docker builds" >&2 && exit 1)
+# Zeabur injects the production NODE_ENV as a build secret. Explicitly include
+# devDependencies because the Next.js build still needs fumadocs-mdx and the
+# other checked-in build tooling before the runner stage switches to production.
 # `npm rebuild <pkg>` re-runs the package's own install script, so under npm 11 +
 # `--ignore-scripts` on the parent `npm ci` it depends on npm's script-allowlist
 # machinery correctly re-enabling that one package's script. Some self-hosted build
@@ -104,7 +107,7 @@ RUN test -f package-lock.json \
 # instead of `npx --yes`, which would install an arbitrary registry version
 # on-demand and run its lifecycle scripts (Sonar docker:S6505).
 RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-npm-cache,target=/root/.npm \
-  npm ci --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
+  npm ci --include=dev --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
   && (cd node_modules/better-sqlite3 \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild) \
   && node -e "require('better-sqlite3')(':memory:').close()" \
