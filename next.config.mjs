@@ -1,7 +1,7 @@
 import createNextIntlPlugin from "next-intl/plugin";
 import { createMDX } from "fumadocs-mdx/next";
 import { builtinModules } from "node:module";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { betterSqlite3AliasFor } from "./scripts/build/better-sqlite3-stub-flag.mjs";
 import { mitmManagerAliasFor } from "./scripts/build/mitm-stub-flag.mjs";
@@ -388,12 +388,20 @@ const nextConfig = {
       ...(config.ignoreWarnings || []),
       isNextIntlExtractorDynamicImportWarning,
     ];
+    // The Docker/Zeabur webpack build also compiles the workspace package directly.
+    // In that graph Next can leave the TypeScript `@/*` paths unresolved even though
+    // the root tsconfig is present. Keep the source alias explicit so the complete
+    // dashboard graph resolves identically in local and local-upload builds.
+    config.resolve = config.resolve || {};
+    config.resolve.alias = {
+      ...(config.resolve.alias || {}),
+      "@": resolve(projectRoot, "src"),
+    };
     if (!isServer) {
       // A few dashboard helpers share files with server-only health/quota code. Their
       // server branches are never called in the browser, but webpack still resolves
       // the Node builtins reachable from those branches. Keep those imports inert in
       // the client graph; the server graph continues to use the real Node modules.
-      config.resolve = config.resolve || {};
       config.resolve.fallback = {
         ...(config.resolve.fallback || {}),
         ...Object.fromEntries(
@@ -415,12 +423,9 @@ const nextConfig = {
           resource.request = resource.request.slice(5);
         })
       );
-      config.resolve.alias = {
-        ...(config.resolve.alias || {}),
-        "stream/web": false,
-        "timers/promises": false,
-        "util/types": false,
-      };
+      config.resolve.alias["stream/web"] = false;
+      config.resolve.alias["timers/promises"] = false;
+      config.resolve.alias["util/types"] = false;
     }
     const infrastructureLogging = config.infrastructureLogging || {};
     config.infrastructureLogging = {
