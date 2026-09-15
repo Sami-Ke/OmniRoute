@@ -1,4 +1,4 @@
-import { normalizeChatGptWebStorageState } from "@omniroute/open-sse/utils/chatgptWebExecutorAdapter.ts";
+import { normalizeChatGptWebStorageState } from "@omniroute/open-sse/utils/chatgptWebStorageState.ts";
 
 export type ChatGptWebValidationResult = {
   valid: boolean;

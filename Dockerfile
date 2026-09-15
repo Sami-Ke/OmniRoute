@@ -110,22 +110,23 @@ RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-npm-cache,targe
   && node -e "require('better-sqlite3')(':memory:').close()" \
   && node -e "const wreq=require('wreq-js'); if(typeof wreq.createTransport!=='function') process.exit(1)"
 
-# Build with Turbopack (stable in Next 16, the repo default). The v3.8.27-era
-# TurbopackInternalError panic ("entered unreachable code: there must be a path to a
-# root" in ImportTracer::get_traces) no longer reproduces on Next 16.2.9 — validated
-# 2026-07-05 with clean amd64 (12min14s, image smoke-tested: /api/monitoring/health
-# 200) and arm64 (qemu, exit 0, zero panic strings) builds. Turbopack cut the bare
-# build from 17min to 9min on the same 32-core box. Webpack stays available as the
-# escape hatch: `--build-arg`/-e OMNIROUTE_USE_TURBOPACK=0.
+# Build Docker production images with webpack. The official Docker publish workflow
+# passes OMNIROUTE_USE_TURBOPACK=0 explicitly; keeping that as the image default also
+# covers local-upload platforms such as Zeabur. Turbopack remains available as an
+# explicit opt-in with `--build-arg OMNIROUTE_USE_TURBOPACK=1`.
 # See docs/ops/QUALITY_GATE_PLAYBOOK.md Parte 6.
 #
 # Declared as ARG+ENV, not a bare ENV: a bare ENV shadows any same-named ARG for
 # the rest of the stage, so `--build-arg OMNIROUTE_USE_TURBOPACK=0` was silently
-# ignored and the escape hatch above only ever worked via `-e` at runtime, never
-# at build time. Turbopack compiles in native Rust memory that lives outside the
-# V8 heap, so OMNIROUTE_BUILD_MEMORY_MB cannot bound it and a memory-constrained
-# build host gets SIGKILLed by the cgroup OOM killer with no error message.
-ARG OMNIROUTE_USE_TURBOPACK=1
+# ignored and the build-time choice only ever worked via `-e` at runtime, never at
+# build time. Turbopack compiles in native Rust memory that lives outside the V8
+# heap, so OMNIROUTE_BUILD_MEMORY_MB cannot bound it and a memory-constrained build
+# host gets SIGKILLed by the cgroup OOM killer with no error message.
+# The official Docker publish workflow passes `0` explicitly. Keep the same
+# production-image default for local-upload platforms (such as Zeabur) that do
+# not import that workflow's build arguments. The runtime/provider behavior is
+# unchanged; this selects the complete dashboard webpack build path.
+ARG OMNIROUTE_USE_TURBOPACK=0
 ENV OMNIROUTE_USE_TURBOPACK="${OMNIROUTE_USE_TURBOPACK}"
 
 # Next.js basePath is fixed at build time; pass OMNIROUTE_BASE_PATH here when the

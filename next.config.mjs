@@ -1,5 +1,6 @@
 import createNextIntlPlugin from "next-intl/plugin";
 import { createMDX } from "fumadocs-mdx/next";
+import { builtinModules } from "node:module";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { betterSqlite3AliasFor } from "./scripts/build/better-sqlite3-stub-flag.mjs";
@@ -382,11 +383,45 @@ const nextConfig = {
     // TODO: Re-enable after fixing all sub-component useTranslations scope issues
     ignoreBuildErrors: true,
   },
-  webpack(config, { dev, webpack }) {
+  webpack(config, { dev, isServer, webpack }) {
     config.ignoreWarnings = [
       ...(config.ignoreWarnings || []),
       isNextIntlExtractorDynamicImportWarning,
     ];
+    if (!isServer) {
+      // A few dashboard helpers share files with server-only health/quota code. Their
+      // server branches are never called in the browser, but webpack still resolves
+      // the Node builtins reachable from those branches. Keep those imports inert in
+      // the client graph; the server graph continues to use the real Node modules.
+      config.resolve = config.resolve || {};
+      config.resolve.fallback = {
+        ...(config.resolve.fallback || {}),
+        ...Object.fromEntries(
+          builtinModules.filter((name) => !name.startsWith("node:")).map((name) => [name, false])
+        ),
+        child_process: false,
+        dns: false,
+        fs: false,
+        "fs/promises": false,
+        module: false,
+        net: false,
+        sqlite: false,
+        "timers/promises": false,
+        tls: false,
+        "util/types": false,
+      };
+      config.plugins.push(
+        new webpack.NormalModuleReplacementPlugin(/^node:(.+)$/, (resource) => {
+          resource.request = resource.request.slice(5);
+        })
+      );
+      config.resolve.alias = {
+        ...(config.resolve.alias || {}),
+        "stream/web": false,
+        "timers/promises": false,
+        "util/types": false,
+      };
+    }
     const infrastructureLogging = config.infrastructureLogging || {};
     config.infrastructureLogging = {
       ...infrastructureLogging,

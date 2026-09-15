@@ -7,4 +7,4 @@
  * boundary — see EXECUTOR_IMPORT_RESTRICTION in eslint.config.mjs), so they go through
  * this service instead of reaching into the executor tree.
  */
-export { extractZaiToken } from "../executors/zai-web/protocol.ts";
+export { extractZaiToken } from "../utils/zaiCredential.ts";

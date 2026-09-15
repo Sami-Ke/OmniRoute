@@ -56,6 +56,7 @@ export interface ChatGptWebBrowserTurnResult {
   conversationId: string;
   turnExchangeId: string;
   text: string;
+  metadata?: Record<string, unknown>;
   status: string;
   endTurn: true;
 }
@@ -75,6 +76,12 @@ export interface PlaywrightChatGptWebBrowserSessionOptions {
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function citationMetadata(message: JsonRecord): Record<string, unknown> | undefined {
+  const metadata = isRecord(message.metadata) ? message.metadata : null;
+  if (!Array.isArray(metadata?.content_references)) return undefined;
+  return { content_references: structuredClone(metadata.content_references) };
 }
 
 function requirePrompt(value: string): string {
@@ -115,10 +122,12 @@ function maybeTerminalResult(
   ) {
     return null;
   }
+  const metadata = citationMetadata(message);
   return {
     conversationId,
     turnExchangeId,
     text: parts.join(""),
+    ...(metadata ? { metadata } : {}),
     status: message.status,
     endTurn: true,
   };

@@ -5,7 +5,6 @@ import test from "node:test";
 
 test("legacy common ChatGPT Web derived implementation files remain absent", () => {
   const removedPaths = [
-    "open-sse/executors/chatgpt-web/citations.ts",
     "open-sse/executors/chatgpt-web/handoff.ts",
     "open-sse/executors/chatgpt-web/models.ts",
     "open-sse/executors/chatgptWebErrors.ts",
@@ -27,10 +26,12 @@ test("legacy common ChatGPT Web derived implementation files remain absent", () 
   for (const relativePath of [
     "open-sse/config/providers/registry/chatgpt-web/index.ts",
     "open-sse/executors/chatgpt-web.ts",
+    "open-sse/executors/chatgpt-web/citations.ts",
     "open-sse/utils/chatgptWebBrowserSession.ts",
     "open-sse/utils/chatgptWebDeltaV1.ts",
     "open-sse/utils/chatgptWebExecutorAdapter.ts",
     "open-sse/utils/chatgptWebTransport.ts",
+    "open-sse/utils/webCitations.ts",
   ]) {
     assert.equal(fs.existsSync(relativePath), true, `${relativePath} must ship`);
   }

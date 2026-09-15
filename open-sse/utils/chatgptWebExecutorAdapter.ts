@@ -18,33 +18,27 @@ import {
   type ChatGptWebBrowserTurnResult,
   type ChatGptWebUiSelection,
 } from "./chatgptWebBrowserSession.ts";
+import { renderChatGptTextWithAnnotations } from "../executors/chatgpt-web/citations.ts";
+import {
+  normalizeChatGptWebStorageState,
+  type ChatGptWebStorageState,
+} from "./chatgptWebStorageState.ts";
+
+export { normalizeChatGptWebStorageState } from "./chatgptWebStorageState.ts";
+export type {
+  ChatGptWebStorageCookie,
+  ChatGptWebStorageOrigin,
+  ChatGptWebStorageState,
+} from "./chatgptWebStorageState.ts";
 
 type JsonRecord = Record<string, unknown>;
 
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 const CHATGPT_WEB_PAGE_URL = "https://chatgpt.com/?temporary-chat=true";
 const MAX_PROMPT_BYTES = 4 * 1024 * 1024;
-const FIRST_PARTY_COOKIE_HOSTS = ["chatgpt.com", "openai.com"] as const;
-
-export interface ChatGptWebStorageCookie extends JsonRecord {
-  name: string;
-  value: string;
-  domain: string;
-  path: string;
-  expires: number;
-  httpOnly: boolean;
-  secure: boolean;
-  sameSite: "Strict" | "Lax" | "None";
-}
-
-export interface ChatGptWebStorageOrigin extends JsonRecord {
-  origin: string;
-  localStorage: Array<{ name: string; value: string }>;
-}
-
-export interface ChatGptWebStorageState {
-  cookies: ChatGptWebStorageCookie[];
-  origins: ChatGptWebStorageOrigin[];
-}
 
 export interface PreparedChatGptWebBrowserRequest {
   prompt: string;
@@ -70,68 +64,6 @@ export interface ChatGptWebExecutorAdapterDeps {
   ) => Promise<ChatGptWebBrowserTurnResult>;
   id?: () => string;
   now?: () => number;
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isFirstPartyHost(value: string): boolean {
-  const host = value.toLowerCase().replace(/^\./, "");
-  return FIRST_PARTY_COOKIE_HOSTS.some(
-    (allowed) => host === allowed || host.endsWith(`.${allowed}`)
-  );
-}
-
-function validateCookie(value: unknown): asserts value is ChatGptWebStorageCookie {
-  if (
-    !isRecord(value) ||
-    typeof value.name !== "string" ||
-    !value.name ||
-    typeof value.value !== "string" ||
-    typeof value.domain !== "string" ||
-    typeof value.path !== "string" ||
-    !value.path.startsWith("/") ||
-    typeof value.expires !== "number" ||
-    !Number.isFinite(value.expires) ||
-    typeof value.httpOnly !== "boolean" ||
-    typeof value.secure !== "boolean" ||
-    !["Strict", "Lax", "None"].includes(String(value.sameSite))
-  ) {
-    throw new Error("ChatGPT Web browser storage state contains an invalid cookie");
-  }
-  if (!isFirstPartyHost(value.domain)) {
-    throw new Error("ChatGPT Web browser storage state contains a foreign cookie domain");
-  }
-}
-
-function validateOrigin(value: unknown): asserts value is ChatGptWebStorageOrigin {
-  if (!isRecord(value) || typeof value.origin !== "string" || !Array.isArray(value.localStorage)) {
-    throw new Error("ChatGPT Web browser storage state contains an invalid origin");
-  }
-  let url: URL;
-  try {
-    url = new URL(value.origin);
-  } catch {
-    throw new Error("ChatGPT Web browser storage state contains an invalid origin");
-  }
-  if (url.protocol !== "https:" || !isFirstPartyHost(url.hostname)) {
-    throw new Error("ChatGPT Web browser storage state contains a foreign origin");
-  }
-  for (const entry of value.localStorage) {
-    if (!isRecord(entry) || typeof entry.name !== "string" || typeof entry.value !== "string") {
-      throw new Error("ChatGPT Web browser storage state contains invalid local storage");
-    }
-  }
-}
-
-export function normalizeChatGptWebStorageState(value: unknown): ChatGptWebStorageState {
-  if (!isRecord(value) || !Array.isArray(value.cookies) || !Array.isArray(value.origins)) {
-    throw new Error("ChatGPT Web browser storage state is invalid");
-  }
-  for (const cookie of value.cookies) validateCookie(cookie);
-  for (const origin of value.origins) validateOrigin(origin);
-  return structuredClone(value) as unknown as ChatGptWebStorageState;
 }
 
 function contentText(value: unknown): string {
@@ -350,8 +282,20 @@ export function buildChatGptWebOpenAiResponse(
   stream: boolean,
   metadata: { id?: string; created?: number } = {}
 ): Response {
+  type ChatGptWebSseChunk = {
+    id: string;
+    object: "chat.completion.chunk";
+    created: number;
+    model: string;
+    choices: Array<{
+      index: number;
+      delta: Record<string, unknown>;
+      finish_reason: string | null;
+    }>;
+  };
   const id = metadata.id ?? `chatcmpl-${randomUUID()}`;
   const created = metadata.created ?? Math.floor(Date.now() / 1000);
+  const rendered = renderChatGptTextWithAnnotations(result.text, result.metadata);
   if (!stream) {
     return Response.json({
       id,
@@ -361,14 +305,18 @@ export function buildChatGptWebOpenAiResponse(
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: result.text },
+          message: {
+            role: "assistant",
+            content: rendered.content,
+            annotations: rendered.annotations,
+          },
           finish_reason: "stop",
         },
       ],
     });
   }
 
-  const chunks = [
+  const chunks: ChatGptWebSseChunk[] = [
     {
       id,
       object: "chat.completion.chunk",
@@ -381,16 +329,25 @@ export function buildChatGptWebOpenAiResponse(
       object: "chat.completion.chunk",
       created,
       model,
-      choices: [{ index: 0, delta: { content: result.text }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: rendered.content }, finish_reason: null }],
     },
-    {
+  ];
+  if (rendered.annotations.length > 0) {
+    chunks.push({
       id,
       object: "chat.completion.chunk",
       created,
       model,
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-    },
-  ];
+      choices: [{ index: 0, delta: { annotations: rendered.annotations }, finish_reason: null }],
+    });
+  }
+  chunks.push({
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  });
   return new Response(
     chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n",
     { headers: { "Content-Type": "text/event-stream; charset=utf-8" } }

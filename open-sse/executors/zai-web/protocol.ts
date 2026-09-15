@@ -2,7 +2,9 @@ import { Buffer } from "node:buffer";
 import { createHmac, randomUUID } from "node:crypto";
 import type { ProviderCredentials } from "../base.ts";
 import { extractImageUrls } from "../../utils/cursorImages.ts";
-import { normalizeCookie, sanitizeErrorMessage } from "../../utils/error.ts";
+import { sanitizeErrorMessage } from "../../utils/error.ts";
+
+export { extractZaiToken } from "../../utils/zaiCredential.ts";
 
 export const ZAI_BASE_URL = "https://chat.z.ai";
 export const ZAI_NEW_CHAT_URL = `${ZAI_BASE_URL}/api/v1/chats/new`;
@@ -155,25 +157,6 @@ function parseCredentialJson(raw: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-/** Extract the localStorage Bearer token, while accepting legacy token= input. */
-export function extractZaiToken(rawCredential: string): string {
-  const trimmed = rawCredential.trim();
-  const json = parseCredentialJson(trimmed);
-  if (json) {
-    const token = json.token ?? json.accessToken ?? json.access_token;
-    return typeof token === "string" ? token.trim() : "";
-  }
-
-  const bearer = trimmed.match(/^(?:Authorization:\s*)?Bearer\s+(.+)$/i);
-  if (bearer) return bearer[1].trim();
-
-  const normalized = normalizeCookie(trimmed);
-  if (!normalized) return "";
-  const match = normalized.match(/(?:^|;\s*)token=([^;]+)/);
-  if (match) return match[1].trim();
-  return normalized.includes(";") || normalized.includes("=") ? "" : normalized;
 }
 
 /** Read the short-lived browser CAPTCHA proof from supported input locations. */
