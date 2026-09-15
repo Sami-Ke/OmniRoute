@@ -14,7 +14,7 @@ export async function GET(request?: NextRequest) {
     let agentCard: any = null;
     if (enabled) {
       try {
-        const agentModule = await import("@/app/.well-known/agent.json/route");
+        const agentModule = await import("../../../.well-known/agent.json/route");
         const cardResponse = await agentModule.GET(request);
         agentCard = await cardResponse.json();
       } catch {
